@@ -188,7 +188,7 @@ func Mount(cfg Config) (*Server, error) {
 		AttrTimeout:  durPtr(time.Second),
 		EntryTimeout: durPtr(time.Second),
 		MountOptions: fuse.MountOptions{
-			AllowOther: false,
+			AllowOther: true,
 			FsName:     "place",
 			Name:       "place",
 			Debug:      cfg.Debug,
