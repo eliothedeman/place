@@ -1,9 +1,13 @@
 services:
   place:
-    build: .
-    image: place:latest
+    # Published by .github/workflows/docker.yml on every push to master.
+    # Pin to a sha- or v-tag for reproducible deploys: ghcr.io/eliothedeman/place:sha-abc1234
+    image: ghcr.io/eliothedeman/place:latest
+    # Uncomment for local builds (e.g. `podman compose up --build`):
+    # build: .
     container_name: place
     restart: unless-stopped
+    pull_policy: always
 
     # FUSE needs SYS_ADMIN + access to /dev/fuse. Default AppArmor blocks
     # mount(2), so it has to be disabled for this container.
