@@ -1,0 +1,13 @@
+.git
+.gitignore
+main
+/place
+a/
+b/
+c/
+db.db
+*.db
+*.db.lock
+Dockerfile
+.dockerignore
+docker-compose.yml

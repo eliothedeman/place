@@ -1,0 +1,48 @@
+services:
+  place:
+    build: .
+    image: place:latest
+    container_name: place
+    restart: unless-stopped
+
+    # FUSE needs SYS_ADMIN + access to /dev/fuse. Default AppArmor blocks
+    # mount(2), so it has to be disabled for this container.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
+
+    volumes:
+      # Hot tier — point at your fast (SSD/NVMe) TrueNAS dataset.
+      - type: bind
+        source: /mnt/tank/place-hot
+        target: /mnt/hot
+
+      # Cold tier — point at your slow (HDD) TrueNAS dataset.
+      - type: bind
+        source: /mnt/tank/place-cold
+        target: /mnt/cold
+
+      # FUSE mount — exposed back to the host. `rshared` propagation makes
+      # the FUSE mount visible outside the container (e.g. to SMB/NFS shares
+      # on TrueNAS). The host directory must itself be a shared mount; on
+      # TrueNAS Scale /mnt is already rshared.
+      - type: bind
+        source: /mnt/tank/place
+        target: /mnt/place
+        bind:
+          propagation: rshared
+
+    # Extra `place mount` flags go here. Hot/cold/mount paths are wired up
+    # by docker-entrypoint.sh (which also disables --debug and --pprof-addr
+    # by default), so do NOT pass --hot/--cold/--mount. Re-enable pprof or
+    # FUSE debug by appending the flags here — last value wins.
+    # command:
+    #   - --evict-at=0.85
+    #   - --evict-to=0.75
+    #   - --replicate-after=30m
+    #   - --replicate-max-bytes=20GB
+    #   - --pprof-addr=:6060
+    #   - --debug=true
