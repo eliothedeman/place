@@ -77,7 +77,12 @@ func NewWriter(hot *SegmentSet, meta *Meta, ev *Evictor) *Writer {
 		flushedCh:     make(chan struct{}),
 		flushKick:     make(chan struct{}, 1),
 		flushDone:     make(chan struct{}),
-		flushInterval: 10 * time.Millisecond,
+		// flushInterval is a backstop only — UpdateLocked/ViewLocked
+		// auto-flush on demand for read-after-write consistency, and
+		// syncInterval drives the full fsync. The previous 10ms cadence
+		// burned ~half of the binary's CPU on bbolt write-amplification
+		// even when nothing read needed the data flushed.
+		flushInterval: 500 * time.Millisecond,
 		syncInterval:  1 * time.Second,
 	}
 	go w.loop()
