@@ -190,8 +190,6 @@ func (n *placeNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAt
 		now := time.Now().UnixNano()
 		if t, ok := in.GetMTime(); ok {
 			fm.Mtime = t.UnixNano()
-		} else {
-			fm.Mtime = now
 		}
 		if t, ok := in.GetATime(); ok {
 			fm.Atime = t.UnixNano()
