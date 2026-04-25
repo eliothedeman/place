@@ -9,6 +9,12 @@ services:
     restart: unless-stopped
     pull_policy: always
 
+    # Shutdown can take a while if a replicate or GC pass is in flight —
+    # the binary drains both before closing bbolt. Default 10s would
+    # SIGKILL mid-pass on big filesystems.
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+
     # FUSE needs SYS_ADMIN + access to /dev/fuse. Default AppArmor blocks
     # mount(2), so it has to be disabled for this container.
     cap_add:

@@ -112,9 +112,12 @@ func (m *mount) Run(args []string) {
 	go func() {
 		s := <-sig
 		log.Printf("place: received %s, unmounting...", s)
-		server.Unmount()
+		// Run Unmount in its own goroutine. server.Unmount() calls
+		// shutdown() synchronously (compact.Stop, writer.Close, meta.Close)
+		// which can take a while; if we did it inline here we'd never
+		// reach the second <-sig read, defeating the force-exit path.
+		go server.Unmount()
 
-		// Second signal force-exits.
 		s = <-sig
 		log.Printf("place: received %s again, forcing exit", s)
 		os.Exit(1)

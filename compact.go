@@ -372,6 +372,11 @@ func (c *Compactor) gcPass(tier Tier) {
 		activeID = a.id
 	}
 	for _, sm := range segs {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
 		if sm.ID == activeID {
 			continue
 		}
@@ -449,6 +454,11 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	// For each ref, read its live fragments on this segment, rewrite to
 	// active, update meta.
 	for _, rel := range refs {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
 		if err := c.rewriteRefs(rel, tier, target.ID, oldSeg, set); err != nil {
 			log.Printf("place: gc rewrite %q: %v", rel, err)
 			return
