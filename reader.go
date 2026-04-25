@@ -8,6 +8,15 @@ import (
 	"syscall"
 )
 
+// firstColdOverlap returns the index of the first cold fragment whose
+// end is past `off`, using a binary search on the sorted, non-overlapping
+// cold fragment list.
+func firstColdOverlap(cold []Fragment, off int64) int {
+	return sort.Search(len(cold), func(i int) bool {
+		return cold[i].LogicalOffset+cold[i].Length > off
+	})
+}
+
 // Reader serves random reads over a file's fragments, preferring hot
 // segments and falling back to cold for any gaps.
 type Reader struct {
@@ -67,15 +76,22 @@ func (r *Reader) ReadAt(rel string, dst []byte, off int64) (int, error) {
 type span struct{ start, end int64 }
 
 // planColdForGaps emits cold-fragment slices that cover the given gaps in the
-// caller's buffer (gaps are coordinates relative to `off`).
+// caller's buffer (gaps are coordinates relative to `off`). Cold fragments
+// are sorted by LogicalOffset; each gap is served by binary-searching to
+// the first overlapping fragment and walking until past the gap.
 func planColdForGaps(cold []Fragment, gaps []span, off int64) []readSlice {
+	if len(cold) == 0 {
+		return nil
+	}
 	var out []readSlice
 	for _, g := range gaps {
 		gapAbsStart := off + g.start
 		gapAbsEnd := off + g.end
-		for _, f := range cold {
-			if f.End() <= gapAbsStart || f.LogicalOffset >= gapAbsEnd {
-				continue
+		i := firstColdOverlap(cold, gapAbsStart)
+		for ; i < len(cold); i++ {
+			f := cold[i]
+			if f.LogicalOffset >= gapAbsEnd {
+				break
 			}
 			start := f.LogicalOffset
 			if start < gapAbsStart {

@@ -1,5 +1,7 @@
 package place
 
+import "sort"
+
 // mergeFragment splices `n` into a sorted, non-overlapping fragment list.
 // Existing fragments that overlap with `n` are truncated or removed, with
 // the displaced ranges returned as `dead`. The returned `merged` list is
@@ -116,18 +118,30 @@ type readSlice struct {
 // planRead returns the list of scatter-gather reads needed to fill
 // [readOff, readOff+readLen). Bytes not covered by any fragment are "holes"
 // — callers should pre-zero their buffer to get implicit zero-fill.
+//
+// Fragments are sorted by LogicalOffset and non-overlapping (per
+// mergeFragment), so we binary-search for the first fragment whose end is
+// past readOff and walk forward until we pass readEnd. O(log n + k) for k
+// overlapping fragments — the linear-scan version was a real cost on
+// large files with many small writes (rsync of a 35 GB movie ends up
+// with ~140K fragments).
 func planRead(frags []Fragment, readOff, readLen int64) []readSlice {
-	if readLen <= 0 {
+	if readLen <= 0 || len(frags) == 0 {
 		return nil
 	}
 	readEnd := readOff + readLen
+	// First fragment whose End() > readOff — i.e. could overlap [readOff, ...).
+	i := sort.Search(len(frags), func(i int) bool {
+		return frags[i].LogicalOffset+frags[i].Length > readOff
+	})
 	var out []readSlice
-	for _, f := range frags {
+	for ; i < len(frags); i++ {
+		f := frags[i]
 		fStart := f.LogicalOffset
-		fEnd := f.End()
-		if fEnd <= readOff || fStart >= readEnd {
-			continue
+		if fStart >= readEnd {
+			break
 		}
+		fEnd := f.End()
 		start := fStart
 		if readOff > start {
 			start = readOff

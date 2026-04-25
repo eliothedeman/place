@@ -368,18 +368,23 @@ func (m *Meta) FlushNoSync() error {
 	return m.flushOverlayLocked()
 }
 
-// copyFileMeta makes a deep copy of a FileMeta (fragments are copied).
+// copyFileMeta returns a snapshot of fm whose fragment slices are safe to
+// read concurrently with future writers. It does NOT deep-copy the
+// fragment arrays, because fragments are never mutated in place — every
+// modification path (mergeFragment, truncateFragments, eviction, GC)
+// replaces the slice on fm, never edits an existing Fragment value. The
+// caller's snapshot keeps its own slice header (len/cap/ptr), so a
+// later writer that points fm.HotFragments at a fresh slice doesn't
+// disturb this view, and an in-place append-with-spare-cap doesn't
+// change the snapshot's len.
+//
+// Deep-copying these slices on every read was ~32% of CPU under mixed
+// rsync+hash workloads (35 GB files end up with ~140K fragments).
 func copyFileMeta(fm *FileMeta) *FileMeta {
 	if fm == nil {
 		return nil
 	}
 	out := *fm
-	if len(fm.HotFragments) > 0 {
-		out.HotFragments = append([]Fragment(nil), fm.HotFragments...)
-	}
-	if len(fm.ColdFragments) > 0 {
-		out.ColdFragments = append([]Fragment(nil), fm.ColdFragments...)
-	}
 	return &out
 }
 
