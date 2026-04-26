@@ -191,7 +191,15 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 
 	var appliedReqs []applied
 	touchedSegs := map[uint32]*Segment{}
-	segDelta := map[uint32]int64{}
+	// Track framed and payload bytes per segment separately. Total uses
+	// framed (matches the segment file's actual on-disk size); Live uses
+	// payload only, matching what AddLiveBytesTx subtracts on eviction
+	// (it iterates Fragment.Length, which is payload). Adding framed
+	// size to Live left a permanent ~(headerFixedSize + len(rel) + trailerSize)
+	// residual per record, observable as segments stuck at small but
+	// non-zero Live after every fragment was evicted.
+	segDeltaTotal := map[uint32]int64{}
+	segDeltaLive := map[uint32]int64{}
 
 	for _, r := range batch {
 		recordSize := int64(headerFixedSize + len(r.rel) + len(r.data) + trailerSize)
@@ -212,7 +220,8 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 		}
 		appliedReqs = append(appliedReqs, applied{r, seg.id, segOff})
 		touchedSegs[seg.id] = seg
-		segDelta[seg.id] += recordSize
+		segDeltaTotal[seg.id] += recordSize
+		segDeltaLive[seg.id] += int64(len(r.data))
 	}
 
 	err := w.meta.WithOverlay(func() error {
@@ -253,7 +262,7 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 			}
 			fm.Version++
 		}
-		for id, delta := range segDelta {
+		for id, total := range segDeltaTotal {
 			sm, err := w.meta.getSegLocked(TierHot, id)
 			if err != nil {
 				return err
@@ -262,8 +271,8 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 				sm = &SegmentMeta{ID: id, Tier: TierHot, CreatedAt: now}
 				w.meta.putSegLocked(sm)
 			}
-			sm.Total += delta
-			sm.Live += delta
+			sm.Total += total
+			sm.Live += segDeltaLive[id]
 		}
 		return nil
 	})
