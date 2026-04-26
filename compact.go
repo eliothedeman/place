@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -361,10 +362,14 @@ func (c *Compactor) replicateOne(rel string) error {
 
 var errVersionChanged = fmt.Errorf("version changed")
 
-// gcLoop periodically forward-compacts segments whose live-byte ratio is low.
+// gcLoop periodically reclaims dead and mostly-dead segments. Tick interval
+// is short and per-pass work is bounded so reclaim throughput is bursty in
+// the small but adds up — without this the only thing freeing segments is
+// "wait for every fragment in a segment to be evicted", which never
+// happens for segments shared across an active replicate pass.
 func (c *Compactor) gcLoop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(gcInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -377,17 +382,22 @@ func (c *Compactor) gcLoop() {
 	}
 }
 
-// gcPass picks the deadest segment in the given tier (if dead ratio > 0.6)
-// and forward-compacts its live fragments into the active segment of the
-// same tier. The old segment file is deleted once no fragments reference it.
+const (
+	gcInterval         = 10 * time.Second
+	gcDeadRatio        = 0.3 // forward-compact a segment once it's >30% dead
+	gcMaxFwdPerPass    = 8   // cap on expensive forward-compacts per tick
+)
+
+// gcPass reclaims segments in the given tier:
+//   - drops every fully-dead (Live==0) segment outright
+//   - forward-compacts up to gcMaxFwdPerPass partially-dead ones whose
+//     dead ratio exceeds gcDeadRatio, deadest first
 func (c *Compactor) gcPass(tier Tier) {
 	segs, err := c.meta.ListSegments(tier)
 	if err != nil {
 		log.Printf("place: gc list segments: %v", err)
 		return
 	}
-	var target *SegmentMeta
-	var worstRatio float64 = 0.6
 	set := c.hotSegs
 	if tier == TierCold {
 		set = c.coldSegs
@@ -396,6 +406,14 @@ func (c *Compactor) gcPass(tier Tier) {
 	if a, _ := set.Active(); a != nil {
 		activeID = a.id
 	}
+
+	type candidate struct {
+		sm   *SegmentMeta
+		dead float64
+	}
+	var partials []candidate
+	dropped := 0
+
 	for _, sm := range segs {
 		select {
 		case <-c.ctx.Done():
@@ -419,23 +437,38 @@ func (c *Compactor) gcPass(tier Tier) {
 			}); err != nil {
 				log.Printf("place: gc delete meta %d: %v", sm.ID, err)
 			}
-			c.dbg.log("gc: removed dead segment %d (tier=%d)", sm.ID, tier)
+			dropped++
 			if tier == TierHot {
 				c.ev.Freed()
 			}
 			continue
 		}
 		dead := float64(sm.Total-sm.Live) / float64(sm.Total)
-		if dead > worstRatio {
-			worstRatio = dead
-			target = sm
+		if dead > gcDeadRatio {
+			partials = append(partials, candidate{sm: sm, dead: dead})
 		}
 	}
-	if target == nil {
-		return
+
+	if dropped > 0 {
+		c.dbg.log("gc: dropped %d fully-dead segments (tier=%d)", dropped, tier)
 	}
-	// Forward-compact this segment.
-	c.forwardCompact(tier, target)
+
+	// Forward-compact the deadest partials, up to the per-pass cap.
+	sort.Slice(partials, func(i, j int) bool {
+		return partials[i].dead > partials[j].dead
+	})
+	limit := len(partials)
+	if limit > gcMaxFwdPerPass {
+		limit = gcMaxFwdPerPass
+	}
+	for i := 0; i < limit; i++ {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+		c.forwardCompact(tier, partials[i].sm)
+	}
 }
 
 // forwardCompact walks all FileMetas whose fragments point at segID, copies
