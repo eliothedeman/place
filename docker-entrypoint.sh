@@ -6,5 +6,6 @@ exec /usr/local/bin/place mount \
     --cold=/mnt/cold \
     --mount=/mnt/place \
     --debug=false \
+    --fuse-debug=false \
     --pprof-addr= \
     "$@"

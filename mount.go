@@ -191,7 +191,7 @@ func Mount(cfg Config) (*Server, error) {
 			AllowOther: true,
 			FsName:     "place",
 			Name:       "place",
-			Debug:      cfg.Debug,
+			Debug:      cfg.FuseDebug,
 			MaxWrite:   1 << 20,
 		},
 		NullPermissions: true,

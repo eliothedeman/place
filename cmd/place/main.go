@@ -21,7 +21,8 @@ type mount struct {
 	Cold    string  `help:"path to cold (slow) storage directory"`
 	Mount   string  `help:"path to FUSE mount point"`
 	DB      string  `help:"path to state database (default: {hot}/.place.db)"`
-	Debug         bool   `help:"enable FUSE debug logging"`
+	Debug         bool   `help:"enable place's per-op trace (Lookup/Read/Write/replicate/evict/gc)"`
+	FuseDebug     bool   `help:"enable go-fuse's kernel-protocol trace (very loud — one rx/tx line per FUSE op)"`
 	NoPassthrough bool   `help:"disable FUSE passthrough I/O"`
 	PprofAddr     string `help:"address for pprof HTTP server" default:":6060"`
 	EvictAt float64 `help:"hot disk usage fraction to start eviction (0=disabled)" default:"0.9"`
@@ -82,6 +83,7 @@ func (m *mount) Run(args []string) {
 		MountDir: m.Mount,
 		DBPath:   m.DB,
 		Debug:         m.Debug,
+		FuseDebug:     m.FuseDebug,
 		NoPassthrough: m.NoPassthrough,
 		EvictAt:  m.EvictAt,
 		EvictTo:  m.EvictTo,

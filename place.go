@@ -15,7 +15,15 @@ type Config struct {
 	MountDir string
 	DBPath   string
 
-	Debug         bool
+	// Debug enables place's own per-op trace (Lookup/Read/Write/Readdir
+	// timings, replicate/evict/gc decisions, etc.) via the dbg.log and
+	// dbg.op helpers. Loud but not crushing.
+	Debug bool
+	// FuseDebug enables go-fuse's kernel-protocol trace — the
+	// "rx N: READDIRPLUS …" / "tx N: OK" line per FUSE op. Several
+	// orders of magnitude noisier than Debug; only useful when
+	// reproducing a specific kernel-FUSE issue.
+	FuseDebug     bool
 	NoPassthrough bool // accepted but ignored; userspace is the only path
 
 	// EvictAt is the fraction of hot disk capacity used (0–1) at which
