@@ -58,10 +58,11 @@ func (r *Reader) ReadAt(rel string, dst []byte, off int64) (int, error) {
 		readEnd = fm.Size
 	}
 	readLen := readEnd - off
-	// Pre-zero the window we'll fill.
-	for i := int64(0); i < readLen; i++ {
-		dst[i] = 0
-	}
+	// Pre-zero the window we'll fill (holes in the fragment coverage are
+	// implicit zeros). `clear` lowers to runtime.memclrNoHeapPointers,
+	// which is SIMD-vectorized — the byte-at-a-time loop this replaced
+	// was 23% flat of all CPU under replicate's 16 MiB chunk reads.
+	clear(dst[:readLen])
 
 	hotSlices := planRead(fm.HotFragments, off, readLen)
 	gaps := uncoveredRanges(hotSlices, 0, readLen)
