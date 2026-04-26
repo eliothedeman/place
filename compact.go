@@ -563,11 +563,17 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 	if tier == TierCold {
 		list = fm.ColdFragments
 	}
-	// Read each live fragment into memory.
+	// Read each live fragment into memory. Fragments whose data is no
+	// longer on disk (segment file shorter than bbolt's view, typically
+	// from a prior unclean shutdown) are dropped: keeping them in fm
+	// pins the old segment forever and GC loops on it. The lost bytes
+	// were already irretrievable; surfacing as zero-fill on read is
+	// strictly better than infinite retry.
 	type newLoc struct {
 		old    Fragment
 		newID  uint32
 		newOff int64
+		lost   bool
 	}
 	var news []newLoc
 	for _, f := range list {
@@ -577,7 +583,12 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		}
 		buf := make([]byte, f.Length)
 		if _, err := oldSeg.ReadAt(buf, f.SegmentOffset); err != nil {
-			return err
+			log.Printf("place: gc rewrite %q: dropping unreadable fragment "+
+				"(logical=%d len=%d, segment %d offset=%d): %v — data lost; "+
+				"reads of this byte range will return zero-fill",
+				rel, f.LogicalOffset, f.Length, segID, f.SegmentOffset, err)
+			news = append(news, newLoc{old: f, lost: true})
+			continue
 		}
 		recSize := int64(headerFixedSize + len(rel) + len(buf) + trailerSize)
 		if _, _, err := set.RotateIfFull(recSize); err != nil {
@@ -609,7 +620,12 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 			return errVersionChanged
 		}
 		var updated []Fragment
+		var lostFrags []Fragment
 		for i, f := range list {
+			if news[i].lost {
+				lostFrags = append(lostFrags, f)
+				continue
+			}
 			nf := f
 			nf.SegmentID = news[i].newID
 			nf.SegmentOffset = news[i].newOff
@@ -619,6 +635,13 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 			cur.HotFragments = updated
 		} else {
 			cur.ColdFragments = updated
+		}
+		// Drop lost fragments from the source segment's Live count so it
+		// can become fully dead and GC can finally remove the file.
+		if len(lostFrags) > 0 {
+			if err := AddLiveBytesTx(tx, lostFrags, -1); err != nil {
+				return err
+			}
 		}
 		cur.Version++
 		return PutFileTx(tx, cur)
