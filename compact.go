@@ -570,10 +570,11 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 	// were already irretrievable; surfacing as zero-fill on read is
 	// strictly better than infinite retry.
 	type newLoc struct {
-		old    Fragment
-		newID  uint32
-		newOff int64
-		lost   bool
+		old     Fragment
+		newID   uint32
+		newOff  int64
+		recSize int64 // framed size of the record we wrote at the new location
+		lost    bool
 	}
 	var news []newLoc
 	for _, f := range list {
@@ -605,7 +606,7 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		if err := seg.Sync(); err != nil {
 			return err
 		}
-		news = append(news, newLoc{old: f, newID: seg.id, newOff: segOff})
+		news = append(news, newLoc{old: f, newID: seg.id, newOff: segOff, recSize: recSize})
 	}
 	// Swap in new locations under a transaction; abort if Version changed.
 	return c.meta.UpdateLocked(func(tx *bolt.Tx) error {
@@ -621,6 +622,10 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		}
 		var updated []Fragment
 		var lostFrags []Fragment
+		// Per-destination-segment Total/Live deltas: framed size for Total,
+		// payload size for Live (matches the writer's split accounting and
+		// what AddLiveBytesTx subtracts on eviction).
+		addPerSeg := map[uint32]struct{ total, live int64 }{}
 		for i, f := range list {
 			if news[i].lost {
 				lostFrags = append(lostFrags, f)
@@ -630,6 +635,15 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 			nf.SegmentID = news[i].newID
 			nf.SegmentOffset = news[i].newOff
 			updated = append(updated, nf)
+			// Only count fragments we actually relocated; passthrough
+			// fragments (newID == old SegmentID) were already accounted
+			// when originally written.
+			if news[i].newID != f.SegmentID {
+				v := addPerSeg[news[i].newID]
+				v.total += news[i].recSize
+				v.live += f.Length
+				addPerSeg[news[i].newID] = v
+			}
 		}
 		if tier == TierHot {
 			cur.HotFragments = updated
@@ -640,6 +654,24 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		// can become fully dead and GC can finally remove the file.
 		if len(lostFrags) > 0 {
 			if err := AddLiveBytesTx(tx, lostFrags, -1); err != nil {
+				return err
+			}
+		}
+		// Bump destination segments' Total/Live to reflect the bytes we
+		// just appended. Without this, reconcile-at-restart could see the
+		// active segment file longer than its SegmentMeta.Total and
+		// truncate it, dropping the relocated bytes.
+		for id, v := range addPerSeg {
+			sm, err := GetSegmentTx(tx, tier, id)
+			if err != nil {
+				return err
+			}
+			if sm == nil {
+				sm = &SegmentMeta{ID: id, Tier: tier, CreatedAt: time.Now().UnixNano()}
+			}
+			sm.Total += v.total
+			sm.Live += v.live
+			if err := PutSegmentTx(tx, sm); err != nil {
 				return err
 			}
 		}
