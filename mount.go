@@ -184,16 +184,24 @@ func Mount(cfg Config) (*Server, error) {
 		dbg:      d,
 	}
 
+	mopts := fuse.MountOptions{
+		AllowOther: true,
+		FsName:     "place",
+		Name:       "place",
+		Debug:      cfg.FuseDebug,
+		MaxWrite:   1 << 20, // go-fuse's MAX_KERNEL_WRITE; raising it has no effect.
+	}
+	if cfg.WritebackCache {
+		// Tell the kernel we support write-back caching; it'll then buffer
+		// writes from userspace and ship them to us in MaxWrite-sized
+		// async batches.
+		mopts.ExtraCapabilities |= fuse.CAP_WRITEBACK_CACHE
+	}
+
 	opts := &fs.Options{
-		AttrTimeout:  durPtr(time.Second),
-		EntryTimeout: durPtr(time.Second),
-		MountOptions: fuse.MountOptions{
-			AllowOther: true,
-			FsName:     "place",
-			Name:       "place",
-			Debug:      cfg.FuseDebug,
-			MaxWrite:   1 << 20,
-		},
+		AttrTimeout:     durPtr(time.Second),
+		EntryTimeout:    durPtr(time.Second),
+		MountOptions:    mopts,
 		NullPermissions: true,
 	}
 

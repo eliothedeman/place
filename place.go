@@ -23,8 +23,19 @@ type Config struct {
 	// "rx N: READDIRPLUS …" / "tx N: OK" line per FUSE op. Several
 	// orders of magnitude noisier than Debug; only useful when
 	// reproducing a specific kernel-FUSE issue.
-	FuseDebug     bool
-	NoPassthrough bool // accepted but ignored; userspace is the only path
+	FuseDebug bool
+	// WritebackCache opts into the kernel's FUSE write-back caching
+	// (CAP_WRITEBACK_CACHE). Userspace writes of any size land in the
+	// page cache; the kernel flushes them to place asynchronously in
+	// MaxWrite-sized chunks. This is what lets a tool that issues
+	// 4 KB writes (or 16 MB writes) end up sending well-sized 1 MB
+	// FUSE WRITE ops to us, with fewer FUSE round-trips and bigger
+	// per-record payloads in segments. Trade-offs: stat()'s reported
+	// size/mtime can lag committed state by the page cache flush
+	// interval. Fine for media/archive workloads, surprising for
+	// databases.
+	WritebackCache bool
+	NoPassthrough  bool // accepted but ignored; userspace is the only path
 
 	// EvictAt is the fraction of hot disk capacity used (0–1) at which
 	// eviction begins. Default: 0.9.

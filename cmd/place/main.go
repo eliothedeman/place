@@ -21,9 +21,10 @@ type mount struct {
 	Cold    string  `help:"path to cold (slow) storage directory"`
 	Mount   string  `help:"path to FUSE mount point"`
 	DB      string  `help:"path to state database (default: {hot}/.place.db)"`
-	Debug         bool   `help:"enable place's per-op trace (Lookup/Read/Write/replicate/evict/gc)"`
-	FuseDebug     bool   `help:"enable go-fuse's kernel-protocol trace (very loud — one rx/tx line per FUSE op)"`
-	NoPassthrough bool   `help:"disable FUSE passthrough I/O"`
+	Debug          bool `help:"enable place's per-op trace (Lookup/Read/Write/replicate/evict/gc)"`
+	FuseDebug      bool `help:"enable go-fuse's kernel-protocol trace (very loud — one rx/tx line per FUSE op)"`
+	WritebackCache bool `help:"enable kernel write-back caching: userspace writes of any size land in the page cache and flush to place async in 1 MiB FUSE-WRITE ops, vs every write(2) syscall round-tripping individually. Stat-reported size/mtime can lag the committed state by the page-cache flush interval."`
+	NoPassthrough  bool `help:"disable FUSE passthrough I/O"`
 	PprofAddr     string `help:"address for pprof HTTP server" default:":6060"`
 	EvictAt float64 `help:"hot disk usage fraction to start eviction (0=disabled)" default:"0.9"`
 	EvictTo float64 `help:"hot disk usage fraction to evict down to" default:"0.8"`
@@ -82,9 +83,10 @@ func (m *mount) Run(args []string) {
 		ColdDir:  m.Cold,
 		MountDir: m.Mount,
 		DBPath:   m.DB,
-		Debug:         m.Debug,
-		FuseDebug:     m.FuseDebug,
-		NoPassthrough: m.NoPassthrough,
+		Debug:          m.Debug,
+		FuseDebug:      m.FuseDebug,
+		WritebackCache: m.WritebackCache,
+		NoPassthrough:  m.NoPassthrough,
 		EvictAt:  m.EvictAt,
 		EvictTo:  m.EvictTo,
 		ReplicateAfter:    replicateAfter,

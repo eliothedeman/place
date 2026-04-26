@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/eliothedeman/quack v0.4.0
-	github.com/hanwen/go-fuse/v2 v2.9.0
+	github.com/hanwen/go-fuse/v2 v2.10.1
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/sys v0.41.0
 )
