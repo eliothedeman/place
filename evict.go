@@ -161,7 +161,7 @@ func (e *Evictor) dropCached() int64 {
 	// second transaction to avoid cursor-during-mutation pitfalls.
 	var candidates []string
 	err := e.meta.ViewLocked(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
+		c := tx.Bucket(bucketInodes).Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			fm, err := decodeFileMeta(v)
 			if err != nil {

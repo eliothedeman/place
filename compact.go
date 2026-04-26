@@ -138,7 +138,7 @@ func (c *Compactor) doReplicatePass(reason string) {
 func (c *Compactor) replicatePass() {
 	var candidates []string
 	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
-		cur := tx.Bucket(bucketFiles).Cursor()
+		cur := tx.Bucket(bucketInodes).Cursor()
 		for k, v := cur.First(); k != nil; k, v = cur.Next() {
 			fm, err := decodeFileMeta(v)
 			if err != nil {
@@ -492,7 +492,7 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	// Find all rels referencing this segment.
 	var refs []string
 	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
-		cur := tx.Bucket(bucketFiles).Cursor()
+		cur := tx.Bucket(bucketInodes).Cursor()
 		for k, v := cur.First(); k != nil; k, v = cur.Next() {
 			fm, err := decodeFileMeta(v)
 			if err != nil {

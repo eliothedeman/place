@@ -549,30 +549,35 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 	return 0
 }
 
-// renameSubtree walks all descendants of oldBase under the "files" bucket and
-// rewrites their keys to be rooted at newBase.
+// renameSubtree walks all descendants of oldBase under the paths bucket and
+// rewrites the path keys to be rooted at newBase. Inode entries are
+// preserved (only their fm.Rel is updated to reflect the new primary path).
 func renameSubtree(tx *bolt.Tx, oldBase, newBase string) error {
-	cur := tx.Bucket(bucketFiles).Cursor()
+	cur := tx.Bucket(bucketPaths).Cursor()
 	prefix := childKeyPrefix(oldBase)
 	type pair struct {
 		oldRel string
-		fm     *FileMeta
+		newRel string
 	}
 	var work []pair
-	for k, v := cur.Seek(prefix); k != nil && hasPrefix(k, prefix); k, v = cur.Next() {
-		fm, err := decodeFileMeta(v)
+	for k, _ := cur.Seek(prefix); k != nil && hasPrefix(k, prefix); k, _ = cur.Next() {
+		oldRel := keyToRel(k)
+		newRel := newBase + oldRel[len(oldBase):]
+		work = append(work, pair{oldRel, newRel})
+	}
+	for _, p := range work {
+		fm, err := GetFileTx(tx, p.oldRel)
 		if err != nil {
 			return err
 		}
-		work = append(work, pair{fm.Rel, fm})
-	}
-	for _, p := range work {
-		newRel := newBase + p.oldRel[len(oldBase):]
+		if fm == nil {
+			continue
+		}
 		if err := DeleteFileTx(tx, p.oldRel); err != nil {
 			return err
 		}
-		p.fm.Rel = newRel
-		if err := PutFileTx(tx, p.fm); err != nil {
+		fm.Rel = p.newRel
+		if err := PutFileTx(tx, fm); err != nil {
 			return err
 		}
 	}

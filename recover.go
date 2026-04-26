@@ -133,7 +133,7 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 	}
 	// Walk directory paths and ensure parents exist.
 	return meta.db.Update(func(tx *bolt.Tx) error {
-		cur := tx.Bucket(bucketFiles).Cursor()
+		cur := tx.Bucket(bucketPaths).Cursor()
 		var rels []string
 		for k, _ := cur.First(); k != nil; k, _ = cur.Next() {
 			rels = append(rels, keyToRel(k))

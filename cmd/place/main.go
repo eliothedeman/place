@@ -175,8 +175,38 @@ func parseSize(s string) (int64, error) {
 	return int64(v), nil
 }
 
+type migrateCmd struct {
+	DB     string `help:"path to meta.db (default: {hot}/.place/meta.db)"`
+	Hot    string `help:"path to hot directory (used to derive default DB path)"`
+	DryRun bool   `help:"report what would be migrated without writing"`
+}
+
+func (c *migrateCmd) Help() string {
+	return "Run pending bbolt schema migrations. Creates a backup in .migrations/ before applying. With --dry-run, prints the plan and exits."
+}
+
+func (c *migrateCmd) Run(args []string) {
+	dbPath := c.DB
+	if dbPath == "" {
+		if c.Hot == "" {
+			log.Fatal("--db or --hot is required")
+		}
+		dbPath = c.Hot + "/.place/meta.db"
+	}
+	if c.DryRun {
+		if err := place.DryRunMigrations(dbPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if err := place.RunMigrations(dbPath); err != nil {
+		log.Fatal(err)
+	}
+}
+
 func main() {
 	quack.MustBindCobra("place", quack.Map{
-		"mount": new(mount),
+		"mount":   new(mount),
+		"migrate": new(migrateCmd),
 	}).Execute()
 }

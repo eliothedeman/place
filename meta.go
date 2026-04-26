@@ -15,10 +15,54 @@ import (
 )
 
 var (
-	bucketFiles    = []byte("files")
-	bucketSegments = []byte("segments")
-	bucketConfig   = []byte("config")
+	// bucketFiles is the legacy v0 schema bucket (rel → encoded FileMeta).
+	// The V0→V1 migration drains and deletes it; nothing reads it after.
+	bucketFiles = []byte("files")
+
+	// V1 schema buckets.
+	bucketPaths    = []byte("paths")    // rel → 8-byte inodeID (LE)
+	bucketInodes   = []byte("inodes")   // 8-byte inodeID (LE) → encoded FileMeta
+	bucketSegments = []byte("segments") // unchanged
+	bucketConfig   = []byte("config")   // unchanged
+	bucketMeta     = []byte("_meta")    // schema_version, next_inode_id
+
+	metaKeySchemaVersion = []byte("schema_version")
+	metaKeyNextInodeID   = []byte("next_inode_id")
 )
+
+// inodeKey encodes a uint64 inodeID as the bbolt key for bucketInodes.
+// 8 bytes, big-endian so cursor iteration is in numeric order.
+func inodeKey(id uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], id)
+	return b[:]
+}
+
+func keyToInode(k []byte) uint64 {
+	if len(k) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(k)
+}
+
+// allocInodeID reserves the next inodeID (starting at 1; 0 means "none").
+// Must be called inside a write tx.
+func allocInodeID(tx *bolt.Tx) (uint64, error) {
+	mb := tx.Bucket(bucketMeta)
+	if mb == nil {
+		return 0, errors.New("missing _meta bucket")
+	}
+	var next uint64 = 1
+	if v := mb.Get(metaKeyNextInodeID); v != nil && len(v) == 8 {
+		next = binary.LittleEndian.Uint64(v)
+	}
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], next+1)
+	if err := mb.Put(metaKeyNextInodeID, buf[:]); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
 
 // relKey encodes a rel path as a bbolt key. Every key starts with '/' so
 // that root ("") has a non-empty key (bbolt forbids empty keys).
@@ -71,6 +115,7 @@ type FileMeta struct {
 	HotFragments   []Fragment // sorted by LogicalOffset, non-overlapping
 	ColdFragments  []Fragment // sorted by LogicalOffset, non-overlapping
 	Version        uint64
+	Nlink          uint32 // count of paths pointing at this inode (>=1 while live)
 }
 
 func (fm *FileMeta) IsDir() bool     { return fm.Mode&syscall.S_IFMT == syscall.S_IFDIR }
@@ -151,31 +196,47 @@ func NewMeta(path string) (*Meta, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Ensure all v1 schema buckets exist (idempotent on every open).
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketFiles, bucketSegments, bucketConfig} {
+		for _, b := range [][]byte{bucketPaths, bucketInodes, bucketMeta, bucketSegments, bucketConfig} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
 		}
-		// Ensure root directory exists.
-		fb := tx.Bucket(bucketFiles)
-		if fb.Get(relKey("")) == nil {
-			root := &FileMeta{
-				Rel:   "",
-				Mode:  syscall.S_IFDIR | 0755,
-				Mtime: time.Now().UnixNano(),
-				Ctime: time.Now().UnixNano(),
-				Atime: time.Now().UnixNano(),
-			}
-			enc, err := encodeFileMeta(root)
-			if err != nil {
-				return err
-			}
-			if err := fb.Put(relKey(""), enc); err != nil {
-				return err
-			}
-		}
 		return nil
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// Apply pending schema migrations. Backup is written to .migrations/
+	// alongside the db before any writes.
+	if err := runMigrations(db, path); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// Ensure root directory entry exists. Goes through PutFileTx so it
+	// lands in the right buckets regardless of how we got here (fresh db,
+	// post-migration db, or an existing db where someone deleted root).
+	err = db.Update(func(tx *bolt.Tx) error {
+		root, err := GetFileTx(tx, "")
+		if err != nil {
+			return err
+		}
+		if root != nil {
+			return nil
+		}
+		now := time.Now().UnixNano()
+		return PutFileTx(tx, &FileMeta{
+			Rel:   "",
+			Mode:  syscall.S_IFDIR | 0755,
+			Mtime: now,
+			Ctime: now,
+			Atime: now,
+			Nlink: 1,
+		})
 	})
 	if err != nil {
 		db.Close()
@@ -217,11 +278,7 @@ func (m *Meta) getFileLocked(rel string) (*FileMeta, error) {
 	}
 	var out *FileMeta
 	err := m.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketFiles).Get(relKey(rel))
-		if v == nil {
-			return nil
-		}
-		fm, err := decodeFileMeta(v)
+		fm, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
 		}
@@ -401,27 +458,126 @@ func (m *Meta) GetFile(rel string) (*FileMeta, error) {
 	return copyFileMeta(fm), nil
 }
 
+// inodeForPathTx looks up the inodeID for rel. Returns 0 if no path entry.
+func inodeForPathTx(tx *bolt.Tx, rel string) (uint64, error) {
+	pb := tx.Bucket(bucketPaths)
+	if pb == nil {
+		return 0, nil
+	}
+	v := pb.Get(relKey(rel))
+	if v == nil {
+		return 0, nil
+	}
+	if len(v) != 8 {
+		return 0, fmt.Errorf("paths[%q]: bad inodeID encoding (%d bytes)", rel, len(v))
+	}
+	return binary.LittleEndian.Uint64(v), nil
+}
+
+// putPathTx inserts paths[rel] = inodeID.
+func putPathTx(tx *bolt.Tx, rel string, id uint64) error {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], id)
+	return tx.Bucket(bucketPaths).Put(relKey(rel), b[:])
+}
+
 // GetFileTx returns the FileMeta for rel using an active transaction.
+// Walks paths → inodes. Returns (nil, nil) for a missing path.
 func GetFileTx(tx *bolt.Tx, rel string) (*FileMeta, error) {
-	v := tx.Bucket(bucketFiles).Get(relKey(rel))
+	id, err := inodeForPathTx(tx, rel)
+	if err != nil {
+		return nil, err
+	}
+	if id == 0 {
+		return nil, nil
+	}
+	ib := tx.Bucket(bucketInodes)
+	if ib == nil {
+		return nil, nil
+	}
+	v := ib.Get(inodeKey(id))
 	if v == nil {
 		return nil, nil
 	}
 	return decodeFileMeta(v)
 }
 
-// PutFileTx writes FileMeta within an active transaction.
+// PutFileTx writes FileMeta within an active transaction. If the path is new
+// it allocates a fresh inodeID (and sets fm.Nlink=1). Updates to an existing
+// path go to the same inode and preserve its Nlink.
 func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
+	id, err := inodeForPathTx(tx, fm.Rel)
+	if err != nil {
+		return err
+	}
+	if id == 0 {
+		id, err = allocInodeID(tx)
+		if err != nil {
+			return err
+		}
+		if err := putPathTx(tx, fm.Rel, id); err != nil {
+			return err
+		}
+		if fm.Nlink == 0 {
+			fm.Nlink = 1
+		}
+	} else if fm.Nlink == 0 {
+		// Preserve existing Nlink on update — load it from the inode if the
+		// caller didn't set one. (Most call sites read fm via GetFileTx,
+		// mutate, and write back — so Nlink is already populated.)
+		if v := tx.Bucket(bucketInodes).Get(inodeKey(id)); v != nil {
+			if existing, derr := decodeFileMeta(v); derr == nil {
+				fm.Nlink = existing.Nlink
+			}
+		}
+		if fm.Nlink == 0 {
+			fm.Nlink = 1
+		}
+	}
 	enc, err := encodeFileMeta(fm)
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(bucketFiles).Put(relKey(fm.Rel), enc)
+	return tx.Bucket(bucketInodes).Put(inodeKey(id), enc)
 }
 
-// DeleteFileTx removes the key for rel.
+// DeleteFileTx removes the path entry for rel. If that was the last path
+// pointing at the underlying inode (Nlink would drop to 0), the inode is
+// also removed and its segment-live-bytes credit is returned (caller is
+// responsible for AddLiveBytesTx — historically callers do this *before*
+// DeleteFileTx, so the contract here is unchanged: Nlink-aware unlink is a
+// follow-up task; for V1 every inode has Nlink=1 and unlink fully removes).
 func DeleteFileTx(tx *bolt.Tx, rel string) error {
-	return tx.Bucket(bucketFiles).Delete(relKey(rel))
+	id, err := inodeForPathTx(tx, rel)
+	if err != nil {
+		return err
+	}
+	if id == 0 {
+		return nil
+	}
+	if err := tx.Bucket(bucketPaths).Delete(relKey(rel)); err != nil {
+		return err
+	}
+	ib := tx.Bucket(bucketInodes)
+	v := ib.Get(inodeKey(id))
+	if v == nil {
+		return nil
+	}
+	fm, derr := decodeFileMeta(v)
+	if derr != nil {
+		// Best-effort: if we can't decode we still drop the inode entry to
+		// keep the path/inode buckets consistent.
+		return ib.Delete(inodeKey(id))
+	}
+	if fm.Nlink > 1 {
+		fm.Nlink--
+		enc, eerr := encodeFileMeta(fm)
+		if eerr != nil {
+			return eerr
+		}
+		return ib.Put(inodeKey(id), enc)
+	}
+	return ib.Delete(inodeKey(id))
 }
 
 // PutFile writes a single FileMeta in its own transaction.
@@ -440,14 +596,24 @@ func (m *Meta) DirChildren(parent string) ([]*FileMeta, error) {
 	m.mu.Unlock()
 	var out []*FileMeta
 	err := m.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
+		pb := tx.Bucket(bucketPaths)
+		ib := tx.Bucket(bucketInodes)
+		c := pb.Cursor()
 		prefix := childKeyPrefix(parent)
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 			rel := keyToRel(k)
 			if !isDirectChild(parent, rel) {
 				continue
 			}
-			fm, err := decodeFileMeta(v)
+			if len(v) != 8 {
+				continue
+			}
+			id := binary.LittleEndian.Uint64(v)
+			ev := ib.Get(inodeKey(id))
+			if ev == nil {
+				continue
+			}
+			fm, err := decodeFileMeta(ev)
 			if err != nil {
 				return err
 			}
@@ -497,7 +663,7 @@ func (m *Meta) HasChildren(parent string) (bool, error) {
 	m.mu.Unlock()
 	var found bool
 	err := m.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
+		c := tx.Bucket(bucketPaths).Cursor()
 		prefix := childKeyPrefix(parent)
 		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
 			rel := keyToRel(k)
@@ -593,8 +759,13 @@ func AddLiveBytesTx(tx *bolt.Tx, frags []Fragment, delta int64) error {
 
 // --- encoding ---
 
-const fileMetaVersion byte = 1
-const segmentMetaVersion byte = 1
+const (
+	// fileMetaVersion is the on-disk encoding version. v2 added Nlink at
+	// the tail; v1 records (read only during the V0→V1 schema migration)
+	// default Nlink=1 on decode.
+	fileMetaVersion   byte = 2
+	segmentMetaVersion byte = 1
+)
 
 // fragmentEncodedSize is the on-disk size of one encoded fragment:
 // 8 (LogicalOffset) + 8 (Length) + 1 (Tier) + 4 (SegmentID) + 8 (SegmentOffset)
@@ -613,7 +784,8 @@ func encodeFileMeta(fm *FileMeta) ([]byte, error) {
 	//   4 + N*fragmentEncodedSize  (ColdFragments)
 	total := 1 + 2 + len(fm.Rel) + 4 + 8*4 + 4 + 4 + 2 + len(fm.LinkTarget) + 8 +
 		4 + len(fm.HotFragments)*fragmentEncodedSize +
-		4 + len(fm.ColdFragments)*fragmentEncodedSize
+		4 + len(fm.ColdFragments)*fragmentEncodedSize +
+		4 // Nlink (v2)
 	b := make([]byte, total)
 	p := 0
 	b[p] = fileMetaVersion
@@ -643,6 +815,12 @@ func encodeFileMeta(fm *FileMeta) ([]byte, error) {
 	p += 8
 	p = writeFragments(b, p, fm.HotFragments)
 	p = writeFragments(b, p, fm.ColdFragments)
+	nlink := fm.Nlink
+	if nlink == 0 {
+		nlink = 1 // never persist Nlink=0 — that's a deletion marker
+	}
+	le.PutUint32(b[p:], nlink)
+	p += 4
 	return b[:p], nil
 }
 
@@ -670,8 +848,9 @@ func decodeFileMeta(b []byte) (*FileMeta, error) {
 	if len(b) == 0 {
 		return nil, errors.New("empty filemeta")
 	}
-	if b[0] != fileMetaVersion {
-		return nil, fmt.Errorf("unsupported filemeta version %d", b[0])
+	ver := b[0]
+	if ver != 1 && ver != 2 {
+		return nil, fmt.Errorf("unsupported filemeta version %d", ver)
 	}
 	le := binary.LittleEndian
 	p := 1
@@ -730,6 +909,15 @@ func decodeFileMeta(b []byte) (*FileMeta, error) {
 	}
 	if fm.ColdFragments, p, err = readFragments(b, p); err != nil {
 		return nil, err
+	}
+	if ver >= 2 {
+		if err := need(4); err != nil {
+			return nil, err
+		}
+		fm.Nlink = le.Uint32(b[p:])
+		p += 4
+	} else {
+		fm.Nlink = 1 // v1 entries had no Nlink — implied 1.
 	}
 	return fm, nil
 }
