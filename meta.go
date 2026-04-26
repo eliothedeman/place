@@ -116,6 +116,13 @@ type FileMeta struct {
 	ColdFragments  []Fragment // sorted by LogicalOffset, non-overlapping
 	Version        uint64
 	Nlink          uint32 // count of paths pointing at this inode (>=1 while live)
+
+	// InodeID is the underlying inode identifier — populated by GetFileTx
+	// from the paths bucket lookup. Not serialized (the inodeID is the
+	// inodes-bucket key, so storing it inside the value would be redundant).
+	// Callers may read it (e.g. to wire FUSE Ino → internal inodeID); it's
+	// ignored on PutFileTx, which always looks up via paths[fm.Rel].
+	InodeID uint64
 }
 
 func (fm *FileMeta) IsDir() bool     { return fm.Mode&syscall.S_IFMT == syscall.S_IFDIR }
@@ -482,7 +489,8 @@ func putPathTx(tx *bolt.Tx, rel string, id uint64) error {
 }
 
 // GetFileTx returns the FileMeta for rel using an active transaction.
-// Walks paths → inodes. Returns (nil, nil) for a missing path.
+// Walks paths → inodes. Returns (nil, nil) for a missing path. The
+// returned FileMeta has InodeID populated.
 func GetFileTx(tx *bolt.Tx, rel string) (*FileMeta, error) {
 	id, err := inodeForPathTx(tx, rel)
 	if err != nil {
@@ -499,7 +507,98 @@ func GetFileTx(tx *bolt.Tx, rel string) (*FileMeta, error) {
 	if v == nil {
 		return nil, nil
 	}
-	return decodeFileMeta(v)
+	fm, err := decodeFileMeta(v)
+	if err != nil {
+		return nil, err
+	}
+	fm.InodeID = id
+	return fm, nil
+}
+
+// getInodeTx returns the FileMeta for an inodeID directly, without going
+// through paths. Used by Link (where target's inodeID is already known) and
+// by future Open lifecycle code.
+func getInodeTx(tx *bolt.Tx, id uint64) (*FileMeta, error) {
+	if id == 0 {
+		return nil, nil
+	}
+	ib := tx.Bucket(bucketInodes)
+	if ib == nil {
+		return nil, nil
+	}
+	v := ib.Get(inodeKey(id))
+	if v == nil {
+		return nil, nil
+	}
+	fm, err := decodeFileMeta(v)
+	if err != nil {
+		return nil, err
+	}
+	fm.InodeID = id
+	return fm, nil
+}
+
+// putInodeTx writes fm directly to inodes[id] without touching paths. Used
+// by Link, Rename, and helpers that need to update an inode in place.
+func putInodeTx(tx *bolt.Tx, id uint64, fm *FileMeta) error {
+	if id == 0 {
+		return errors.New("putInodeTx: id=0")
+	}
+	if fm.Nlink == 0 {
+		fm.Nlink = 1
+	}
+	enc, err := encodeFileMeta(fm)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(bucketInodes).Put(inodeKey(id), enc)
+}
+
+// movePathTx renames paths[oldRel] → paths[newRel], preserving the inodeID.
+// If the inode's fm.Rel is currently oldRel, it's updated to newRel (so
+// cold-record framing uses the up-to-date primary name). Returns ENOENT if
+// oldRel doesn't exist; no check on newRel — caller should handle dst-exists.
+func movePathTx(tx *bolt.Tx, oldRel, newRel string) error {
+	pb := tx.Bucket(bucketPaths)
+	v := pb.Get(relKey(oldRel))
+	if v == nil {
+		return syscall.ENOENT
+	}
+	if len(v) != 8 {
+		return fmt.Errorf("paths[%q]: bad inodeID encoding", oldRel)
+	}
+	// Copy the value out of bbolt's mmap before any mutation — bbolt's docs
+	// warn that Put can rebalance pages and invalidate slices returned by
+	// Get within the same tx.
+	id := binary.LittleEndian.Uint64(v)
+	var idBytes [8]byte
+	copy(idBytes[:], v)
+	if err := pb.Put(relKey(newRel), idBytes[:]); err != nil {
+		return err
+	}
+	if err := pb.Delete(relKey(oldRel)); err != nil {
+		return err
+	}
+	// Refresh fm.Rel if it pointed at oldRel.
+	ib := tx.Bucket(bucketInodes)
+	iv := ib.Get(inodeKey(id))
+	if iv == nil {
+		return nil
+	}
+	fm, err := decodeFileMeta(iv)
+	if err != nil {
+		return err
+	}
+	if fm.Rel == oldRel {
+		fm.Rel = newRel
+		fm.InodeID = id
+		enc, err := encodeFileMeta(fm)
+		if err != nil {
+			return err
+		}
+		return ib.Put(inodeKey(id), enc)
+	}
+	return nil
 }
 
 // PutFileTx writes FileMeta within an active transaction. If the path is new
@@ -511,15 +610,30 @@ func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
 		return err
 	}
 	if id == 0 {
-		id, err = allocInodeID(tx)
-		if err != nil {
-			return err
-		}
-		if err := putPathTx(tx, fm.Rel, id); err != nil {
-			return err
-		}
-		if fm.Nlink == 0 {
-			fm.Nlink = 1
+		// If the FileMeta carries an InodeID from a prior load, the caller
+		// is updating an existing inode whose path entry was concurrently
+		// removed (e.g. writer overlay flushing after Unlink). Re-creating
+		// a fresh inode would resurrect the file with a new identity. Use
+		// the original inode if it still exists; otherwise this update is
+		// for a deleted file and should be dropped.
+		if fm.InodeID != 0 {
+			ib := tx.Bucket(bucketInodes)
+			if ib != nil && ib.Get(inodeKey(fm.InodeID)) != nil {
+				id = fm.InodeID
+			} else {
+				return nil // inode gone — silently drop the stale update
+			}
+		} else {
+			id, err = allocInodeID(tx)
+			if err != nil {
+				return err
+			}
+			if err := putPathTx(tx, fm.Rel, id); err != nil {
+				return err
+			}
+			if fm.Nlink == 0 {
+				fm.Nlink = 1
+			}
 		}
 	} else if fm.Nlink == 0 {
 		// Preserve existing Nlink on update — load it from the inode if the
@@ -538,6 +652,7 @@ func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
 	if err != nil {
 		return err
 	}
+	fm.InodeID = id
 	return tx.Bucket(bucketInodes).Put(inodeKey(id), enc)
 }
 
@@ -617,6 +732,13 @@ func (m *Meta) DirChildren(parent string) ([]*FileMeta, error) {
 			if err != nil {
 				return err
 			}
+			// Override fm.Rel with the path actually being iterated.
+			// Otherwise hardlinks (multiple paths sharing one inode) would
+			// all surface in a directory listing under the inode's stored
+			// primary name. Each directory entry needs to display under
+			// its own name.
+			fm.Rel = rel
+			fm.InodeID = id
 			out = append(out, fm)
 		}
 		return nil

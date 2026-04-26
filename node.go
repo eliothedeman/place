@@ -2,9 +2,7 @@ package place
 
 import (
 	"context"
-	"hash/fnv"
 	"path"
-	"sync"
 	"syscall"
 	"time"
 
@@ -25,62 +23,6 @@ type placeRoot struct {
 	compact  *Compactor
 	evict    *Evictor
 	dbg      dbg
-
-	inos inodeMap
-}
-
-type inodeMap struct {
-	mu   sync.RWMutex
-	m    map[string]uint64
-	next uint64
-}
-
-func (im *inodeMap) get(rel string) uint64 {
-	im.mu.RLock()
-	ino, ok := im.m[rel]
-	im.mu.RUnlock()
-	if ok {
-		return ino
-	}
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	if im.m == nil {
-		im.m = map[string]uint64{}
-	}
-	if ino, ok := im.m[rel]; ok {
-		return ino
-	}
-	// Start at 2 — 1 is typically the root.
-	if im.next < 2 {
-		im.next = 2
-	}
-	im.next++
-	im.m[rel] = im.next
-	return im.next
-}
-
-func (im *inodeMap) forget(rel string) {
-	im.mu.Lock()
-	delete(im.m, rel)
-	im.mu.Unlock()
-}
-
-// rename the map entry from old to new.
-func (im *inodeMap) rename(oldRel, newRel string) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	if ino, ok := im.m[oldRel]; ok {
-		delete(im.m, oldRel)
-		im.m[newRel] = ino
-	}
-}
-
-// relHash is a fallback inode number based on FNV64 of the rel path.
-// Used when inos map isn't in scope (rare).
-func relHash(rel string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(rel))
-	return h.Sum64()
 }
 
 type placeNode struct {
@@ -99,7 +41,7 @@ func (pr *placeRoot) stableAttr(fm *FileMeta) fs.StableAttr {
 	return fs.StableAttr{
 		Mode: fm.Mode,
 		Gen:  1,
-		Ino:  pr.inos.get(fm.Rel),
+		Ino:  fm.InodeID, // hardlinks: all paths to the same inode share Ino
 	}
 }
 
@@ -114,9 +56,12 @@ func attrFromMeta(fm *FileMeta, out *fuse.Attr) {
 	out.Ctimensec = uint32(fm.Ctime % 1e9)
 	out.Atime = uint64(fm.Atime / 1e9)
 	out.Atimensec = uint32(fm.Atime % 1e9)
-	// Nlink: directories typically have at least 2; files have 1.
+	// Nlink: directories report 2 (POSIX convention — "." and "..");
+	// regular files and symlinks expose the actual hardlink count.
 	if fm.Mode&syscall.S_IFMT == syscall.S_IFDIR {
 		out.Nlink = 2
+	} else if fm.Nlink > 0 {
+		out.Nlink = fm.Nlink
 	} else {
 		out.Nlink = 1
 	}
@@ -242,7 +187,7 @@ func (n *placeNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		entries = append(entries, fuse.DirEntry{
 			Name: BaseName(fm.Rel),
 			Mode: fm.Mode,
-			Ino:  r.inos.get(fm.Rel),
+			Ino:  fm.InodeID,
 		})
 	}
 	done(0, "entries=%d", len(entries))
@@ -429,11 +374,16 @@ func (n *placeNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		if fm.IsDir() {
 			return syscall.EISDIR
 		}
-		if err := AddLiveBytesTx(tx, fm.HotFragments, -1); err != nil {
-			return err
-		}
-		if err := AddLiveBytesTx(tx, fm.ColdFragments, -1); err != nil {
-			return err
+		// Only release segment-live-bytes credit when the last path is
+		// going away — otherwise the data is still referenced by another
+		// hardlink and segments must keep their fragments live.
+		if fm.Nlink <= 1 {
+			if err := AddLiveBytesTx(tx, fm.HotFragments, -1); err != nil {
+				return err
+			}
+			if err := AddLiveBytesTx(tx, fm.ColdFragments, -1); err != nil {
+				return err
+			}
 		}
 		return DeleteFileTx(tx, rel)
 	})
@@ -445,7 +395,6 @@ func (n *placeNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		done(fs_errno(err))
 		return fs_errno(err)
 	}
-	r.inos.forget(rel)
 	done(0)
 	return 0
 }
@@ -481,7 +430,6 @@ func (n *placeNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		}
 		return fs_errno(err)
 	}
-	r.inos.forget(rel)
 	return 0
 }
 
@@ -492,11 +440,13 @@ var _ = (fs.NodeRenamer)((*placeNode)(nil))
 func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	r := n.root()
 	oldRel := joinRel(n.relPath(), name)
-	np, ok := newParent.(*placeNode)
-	if !ok {
-		return syscall.EXDEV
-	}
-	newRel := joinRel(np.relPath(), newName)
+	// newParent's concrete type may be *placeNode (a regular dir) or
+	// *placeRoot (when renaming into the root dir). Both embed fs.Inode
+	// and satisfy InodeEmbedder, so resolve through the embedded inode
+	// rather than asserting on a single concrete type — the latter
+	// returns EXDEV for any rename whose destination is the mount root.
+	newParentRel := newParent.EmbeddedInode().Path(n.Root())
+	newRel := joinRel(newParentRel, newName)
 	done := r.dbg.op("Rename", oldRel, "-> %q", newRel)
 	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
 		fm, err := GetFileTx(tx, oldRel)
@@ -506,35 +456,45 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 		if fm == nil {
 			return syscall.ENOENT
 		}
-		// If destination exists, overwrite it (unlink-like).
+		// If destination exists, overwrite it (POSIX rename semantics).
+		// Only release the dst inode's segment-live-bytes credit if we'd
+		// actually be deleting the inode (Nlink would drop to 0).
 		if existing, err := GetFileTx(tx, newRel); err == nil && existing != nil {
 			if existing.IsDir() {
 				return syscall.EISDIR
 			}
-			if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
-				return err
-			}
-			if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
-				return err
+			if existing.Nlink <= 1 {
+				if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
+					return err
+				}
+				if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
+					return err
+				}
 			}
 			if err := DeleteFileTx(tx, newRel); err != nil {
 				return err
 			}
 		}
-		// If renaming a directory, also move all descendants.
+		// Directory rename: walk descendants too. Each child path is
+		// repointed to its existing inode.
 		if fm.IsDir() {
 			if err := renameSubtree(tx, oldRel, newRel); err != nil {
 				return err
 			}
 		}
-		// Move the entry itself.
-		fm.Rel = newRel
-		fm.Ctime = time.Now().UnixNano()
-		fm.Version++
-		if err := DeleteFileTx(tx, oldRel); err != nil {
+		// Move the path itself; preserves inodeID (movePathTx also bumps
+		// fm.Rel inside the inode if it was tracking oldRel).
+		if err := movePathTx(tx, oldRel, newRel); err != nil {
 			return err
 		}
-		return PutFileTx(tx, fm)
+		// Bump ctime/version on the (now-moved) inode.
+		post, err := GetFileTx(tx, newRel)
+		if err != nil || post == nil {
+			return err
+		}
+		post.Ctime = time.Now().UnixNano()
+		post.Version++
+		return putInodeTx(tx, post.InodeID, post)
 	})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {
@@ -544,14 +504,15 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 		done(fs_errno(err))
 		return fs_errno(err)
 	}
-	r.inos.rename(oldRel, newRel)
 	done(0)
 	return 0
 }
 
-// renameSubtree walks all descendants of oldBase under the paths bucket and
-// rewrites the path keys to be rooted at newBase. Inode entries are
-// preserved (only their fm.Rel is updated to reflect the new primary path).
+// renameSubtree walks descendants of oldBase under the paths bucket and
+// rewrites their path keys to be rooted at newBase. Inode entries are
+// preserved (movePathTx only changes the paths bucket and updates fm.Rel
+// for the affected inode if applicable). Inode identity is preserved across
+// rename, which is required for hardlinks to behave correctly.
 func renameSubtree(tx *bolt.Tx, oldBase, newBase string) error {
 	cur := tx.Bucket(bucketPaths).Cursor()
 	prefix := childKeyPrefix(oldBase)
@@ -566,18 +527,7 @@ func renameSubtree(tx *bolt.Tx, oldBase, newBase string) error {
 		work = append(work, pair{oldRel, newRel})
 	}
 	for _, p := range work {
-		fm, err := GetFileTx(tx, p.oldRel)
-		if err != nil {
-			return err
-		}
-		if fm == nil {
-			continue
-		}
-		if err := DeleteFileTx(tx, p.oldRel); err != nil {
-			return err
-		}
-		fm.Rel = p.newRel
-		if err := PutFileTx(tx, fm); err != nil {
+		if err := movePathTx(tx, p.oldRel, p.newRel); err != nil {
 			return err
 		}
 	}
@@ -655,6 +605,91 @@ func (n *placeNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 		return nil, syscall.EINVAL
 	}
 	return []byte(fm.LinkTarget), 0
+}
+
+// --- Link (hardlinks) ---
+
+var _ = (fs.NodeLinker)((*placeNode)(nil))
+
+// Link creates a new path entry under n (the destination directory) named
+// `name` that points at the same inode as `target`. POSIX semantics:
+//
+//   - target must be a regular file or symlink (no hardlinks to directories)
+//   - if a path called `name` already exists in n, return EEXIST
+//   - the new entry shares all attributes (size, mode, mtime, fragments…)
+//     with target — they are literally the same inode
+//   - Nlink on the inode is incremented
+//
+// This is the runtime counterpart to the V1 schema's paths/inodes split:
+// hardlinks were architecturally impossible before because each path owned
+// its own FileMeta.
+func (n *placeNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	r := n.root()
+	tn, ok := target.(*placeNode)
+	if !ok {
+		return nil, syscall.EXDEV
+	}
+	targetRel := tn.relPath()
+	newRel := joinRel(n.relPath(), name)
+	done := r.dbg.op("Link", newRel, "→ %q", targetRel)
+
+	var fm *FileMeta
+	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+		// Resolve target's inodeID.
+		targetID, err := inodeForPathTx(tx, targetRel)
+		if err != nil {
+			return err
+		}
+		if targetID == 0 {
+			return syscall.ENOENT
+		}
+		// Reject hardlinks to directories.
+		targetFM, err := getInodeTx(tx, targetID)
+		if err != nil {
+			return err
+		}
+		if targetFM == nil {
+			return syscall.ENOENT
+		}
+		if targetFM.IsDir() {
+			return syscall.EPERM
+		}
+		// Reject if newRel already exists.
+		existingID, err := inodeForPathTx(tx, newRel)
+		if err != nil {
+			return err
+		}
+		if existingID != 0 {
+			return syscall.EEXIST
+		}
+		// Bump Nlink on the shared inode.
+		targetFM.Nlink++
+		targetFM.Ctime = time.Now().UnixNano()
+		if err := putInodeTx(tx, targetID, targetFM); err != nil {
+			return err
+		}
+		// Add the new path entry pointing at the same inode.
+		if err := putPathTx(tx, newRel, targetID); err != nil {
+			return err
+		}
+		fm = targetFM
+		fm.InodeID = targetID
+		return nil
+	})
+	if err != nil {
+		if errno, ok := err.(syscall.Errno); ok {
+			done(errno)
+			return nil, errno
+		}
+		done(fs_errno(err))
+		return nil, fs_errno(err)
+	}
+
+	attrFromMeta(fm, &out.Attr)
+	child := &placeNode{}
+	ino := n.NewInode(ctx, child, r.stableAttr(fm))
+	done(0, "nlink=%d", fm.Nlink)
+	return ino, 0
 }
 
 // --- Statfs ---
