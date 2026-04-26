@@ -414,6 +414,7 @@ func (c *Compactor) gcPass(tier Tier) {
 	var partials []candidate
 	dropped := 0
 
+	var deadIDs []uint32
 	for _, sm := range segs {
 		select {
 		case <-c.ctx.Done():
@@ -427,25 +428,42 @@ func (c *Compactor) gcPass(tier Tier) {
 			continue
 		}
 		if sm.Live == 0 {
-			// Dead segment — drop outright.
-			if err := set.Remove(sm.ID); err != nil {
-				log.Printf("place: gc remove %d: %v", sm.ID, err)
-				continue
-			}
-			if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
-				return DeleteSegmentTx(tx, tier, sm.ID)
-			}); err != nil {
-				log.Printf("place: gc delete meta %d: %v", sm.ID, err)
-			}
-			dropped++
-			if tier == TierHot {
-				c.ev.Freed()
-			}
+			deadIDs = append(deadIDs, sm.ID)
 			continue
 		}
 		dead := float64(sm.Total-sm.Live) / float64(sm.Total)
 		if dead > gcDeadRatio {
 			partials = append(partials, candidate{sm: sm, dead: dead})
+		}
+	}
+
+	// Drop fully-dead segments. Remove the segment files first (cheap
+	// fs ops, no bbolt contention), then delete every SegmentMeta in a
+	// single bbolt write tx — the prior code did one tx per segment,
+	// which throttled fully-dead reclaim to bbolt commit cadence even
+	// though the per-segment work is just a key delete.
+	for _, id := range deadIDs {
+		if err := set.Remove(id); err != nil {
+			log.Printf("place: gc remove %d: %v", id, err)
+			// Continue — we still want to drop the bbolt metadata so
+			// the segment doesn't keep showing up next pass.
+		}
+	}
+	if len(deadIDs) > 0 {
+		if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
+			for _, id := range deadIDs {
+				if err := DeleteSegmentTx(tx, tier, id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Printf("place: gc delete meta (batch %d): %v", len(deadIDs), err)
+		} else {
+			dropped = len(deadIDs)
+			if tier == TierHot {
+				c.ev.Freed()
+			}
 		}
 	}
 
