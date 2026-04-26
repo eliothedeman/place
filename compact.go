@@ -236,6 +236,15 @@ func (c *Compactor) replicateOne(rel string) error {
 		}
 		chunk := buf[:n]
 		if _, err := c.reader.ReadAt(rel, chunk, off); err != nil {
+			// Eviction (which only fires for files that already have a
+			// full cold copy) wipes HotFragments and can leave GC to
+			// remove the now-dead hot segments. If our read failed and
+			// the file is now fully cold, another path completed the
+			// work for us — treat as success and move on.
+			if fmNow, gerr := c.meta.GetFile(rel); gerr == nil && fmNow != nil && fmNow.HasColdCopy() {
+				done(0, "evicted-during-replicate")
+				return nil
+			}
 			done(fs_errno(err))
 			return fmt.Errorf("read %q @%d: %w", rel, off, err)
 		}

@@ -157,8 +157,14 @@ func (r *Reader) execute(slices []readSlice, dst []byte) error {
 			defer wg.Done()
 			for s := range jobs {
 				if err := r.readSlice(s, dst); err != nil {
-					errCh <- err
-					return
+					// Surface the first error per worker, but keep
+					// draining `jobs` so the sender can't deadlock if
+					// every worker errors on its first slice (e.g.
+					// segments removed by GC mid-replicate).
+					select {
+					case errCh <- err:
+					default:
+					}
 				}
 			}
 		}()
