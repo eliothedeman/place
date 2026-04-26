@@ -218,6 +218,16 @@ func (c *Compactor) replicateOne(rel string) error {
 	var records []coldRecord
 	touchedSegs := map[uint32]*Segment{}
 
+	// Log progress every replicateProgressEvery bytes for files large
+	// enough to benefit. Keeps small-file replicate quiet while making
+	// long copies (UHD movies, etc.) visible during the minutes they
+	// spend streaming hot → cold.
+	const replicateProgressEvery = 256 << 20 // 256 MiB
+	var nextProgress int64 = replicateProgressEvery
+	if size >= replicateProgressEvery*2 {
+		c.dbg.log("replicate: %s starting (size=%s)", rel, humanBytes(size))
+	}
+
 	for off := int64(0); off < size; {
 		remaining := size - off
 		n := int64(replicateChunkSize)
@@ -250,6 +260,12 @@ func (c *Compactor) replicateOne(rel string) error {
 		})
 		touchedSegs[seg.id] = seg
 		off += n
+
+		if size >= replicateProgressEvery*2 && off >= nextProgress {
+			c.dbg.log("replicate: %s %s/%s (%.0f%%)",
+				rel, humanBytes(off), humanBytes(size), float64(off)/float64(size)*100)
+			nextProgress += replicateProgressEvery
+		}
 
 		// Yield between chunks for responsiveness.
 		select {

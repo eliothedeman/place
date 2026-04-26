@@ -219,6 +219,8 @@ func (e *Evictor) dropCached() int64 {
 	if freed > 0 {
 		e.Freed()
 		e.dbg.log("evict: freed %s of hot by dropping cached fragments", humanBytes(freed))
+	} else {
+		e.dbg.log("evict: nothing to drop yet (%d candidates scanned, none with full cold copy)", len(candidates))
 	}
 	return freed
 }
