@@ -158,30 +158,28 @@ func (e *Evictor) tick() {
 
 // dropCached drops hot fragments for files whose cold coverage is complete.
 // Returns bytes freed.
+//
+// Walks by inodeID rather than fm.Rel — a hardlink unlink or rename
+// between scan and the mutating tx must not cause us to look the wrong
+// inode up via paths[fm.Rel] (or worse, find nothing and skip silently).
 func (e *Evictor) dropCached() int64 {
 	if e.hot.UsedFraction() < e.evictAt {
 		return 0
 	}
-	// Collect candidate rel paths first (read-only scan), then mutate in a
+	// Collect candidate inode ids first (read-only scan), then mutate in a
 	// second transaction to avoid cursor-during-mutation pitfalls.
-	var candidates []string
+	var candidates []uint64
 	err := e.meta.ViewLocked(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketInodes).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			fm, err := decodeFileMeta(v)
-			if err != nil {
-				return err
-			}
+		return iterateInodesTx(tx, func(id uint64, fm *FileMeta) error {
 			if !fm.IsRegular() || len(fm.HotFragments) == 0 {
-				continue
+				return nil
 			}
 			if !fm.HasColdCopy() {
-				continue
+				return nil
 			}
-			_ = k
-			candidates = append(candidates, fm.Rel)
-		}
-		return nil
+			candidates = append(candidates, id)
+			return nil
+		})
 	})
 	if err != nil {
 		log.Printf("place: dropCached scan: %v", err)
@@ -189,11 +187,11 @@ func (e *Evictor) dropCached() int64 {
 	}
 	var freed int64
 	err = e.meta.UpdateLocked(func(tx *bolt.Tx) error {
-		for _, rel := range candidates {
+		for _, id := range candidates {
 			if e.hot.UsedFraction() < e.evictTo {
 				return nil
 			}
-			fm, err := GetFileTx(tx, rel)
+			fm, err := getInodeTx(tx, id)
 			if err != nil {
 				return err
 			}
@@ -212,7 +210,7 @@ func (e *Evictor) dropCached() int64 {
 			}
 			fm.HotFragments = nil
 			fm.Version++
-			if err := PutFileTx(tx, fm); err != nil {
+			if err := putInodeTx(tx, id, fm); err != nil {
 				return err
 			}
 		}

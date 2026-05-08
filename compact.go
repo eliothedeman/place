@@ -135,37 +135,38 @@ func (c *Compactor) doReplicatePass(reason string) {
 
 // replicatePass picks files needing replication and copies them to cold.
 // Stops when no more candidates or ctx is cancelled.
+//
+// Operates on inodeID rather than fm.Rel — between scan and copy, fm.Rel
+// can be invalidated by hardlink unlink or rename. replicateOne re-fetches
+// the FileMeta via inodeID and uses the freshly-loaded fm.Rel for record
+// framing, which is guaranteed by DeleteFileTx/movePathTx invariants to
+// resolve back to this inode.
 func (c *Compactor) replicatePass() {
-	var candidates []string
+	var candidates []uint64
 	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
-		cur := tx.Bucket(bucketInodes).Cursor()
-		for k, v := cur.First(); k != nil; k, v = cur.Next() {
-			fm, err := decodeFileMeta(v)
-			if err != nil {
-				return err
-			}
+		return iterateInodesTx(tx, func(id uint64, fm *FileMeta) error {
 			if !fm.IsRegular() || len(fm.HotFragments) == 0 {
-				continue
+				return nil
 			}
 			if fm.HasColdCopy() {
-				continue
+				return nil
 			}
-			candidates = append(candidates, fm.Rel)
-		}
-		return nil
+			candidates = append(candidates, id)
+			return nil
+		})
 	})
 	if err != nil {
 		log.Printf("place: replicatePass scan: %v", err)
 		return
 	}
-	for _, rel := range candidates {
+	for _, id := range candidates {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
 		}
-		if err := c.replicateOne(rel); err != nil {
-			log.Printf("place: replicate %q: %v", rel, err)
+		if err := c.replicateOne(id); err != nil {
+			log.Printf("place: replicate inode %d: %v", id, err)
 		}
 	}
 }
@@ -184,20 +185,30 @@ type coldRecord struct {
 	recLen int64 // framed record size (for SegmentMeta.Total bookkeeping)
 }
 
-// replicateOne copies the current contents of rel into cold as one or more
-// chunked fragments and atomically updates metadata. No-op if the file's
-// version changed mid-flight.
-func (c *Compactor) replicateOne(rel string) error {
-	done := c.dbg.op("Replicate", rel)
-	fm1, err := c.meta.GetFile(rel)
+// replicateOne copies the current contents of inodeID into cold as one or
+// more chunked fragments and atomically updates metadata. No-op if the
+// file's version changed mid-flight or if the inode was deleted.
+//
+// Reads the current fm via getInodeTx (not paths[fm.Rel]) so it's robust
+// to hardlink unlink and rename happening between scan and replicate.
+// reader.ReadAt and seg.Append still need a rel — fm.Rel is used because
+// it's guaranteed by DeleteFileTx/movePathTx invariants to resolve back to
+// this inode.
+func (c *Compactor) replicateOne(id uint64) error {
+	var fm1 *FileMeta
+	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
+		got, err := getInodeTx(tx, id)
+		fm1 = got
+		return err
+	})
 	if err != nil {
-		done(fs_errno(err))
 		return err
 	}
 	if fm1 == nil || !fm1.IsRegular() {
-		done(0, "gone")
 		return nil
 	}
+	rel := fm1.Rel
+	done := c.dbg.op("Replicate", rel)
 	if fm1.HasColdCopy() {
 		done(0, "already-complete")
 		return nil
@@ -242,7 +253,12 @@ func (c *Compactor) replicateOne(rel string) error {
 			// remove the now-dead hot segments. If our read failed and
 			// the file is now fully cold, another path completed the
 			// work for us — treat as success and move on.
-			if fmNow, gerr := c.meta.GetFile(rel); gerr == nil && fmNow != nil && fmNow.HasColdCopy() {
+			var fmNow *FileMeta
+			if gerr := c.meta.ViewLocked(func(tx *bolt.Tx) error {
+				got, e := getInodeTx(tx, id)
+				fmNow = got
+				return e
+			}); gerr == nil && fmNow != nil && fmNow.HasColdCopy() {
 				done(0, "evicted-during-replicate")
 				return nil
 			}
@@ -294,14 +310,17 @@ func (c *Compactor) replicateOne(rel string) error {
 		}
 	}
 
-	// Atomically swap in the new cold fragments.
+	// Atomically swap in the new cold fragments. Look up by inodeID so we
+	// don't get tripped up by a path-bucket mutation that happened
+	// mid-flight (rename, unlink-of-hardlink).
 	err = c.meta.UpdateLocked(func(tx *bolt.Tx) error {
-		fm2, err := GetFileTx(tx, rel)
+		fm2, err := getInodeTx(tx, id)
 		if err != nil {
 			return err
 		}
 		if fm2 == nil {
-			// File vanished; leave the cold bytes as dead space.
+			// Inode was deleted (last hardlink unlinked); leave the cold
+			// bytes as dead space.
 			return nil
 		}
 		if fm2.Version != fm1.Version {
@@ -333,13 +352,13 @@ func (c *Compactor) replicateOne(rel string) error {
 			v.live += r.length
 			perSeg[r.segID] = v
 		}
-		for id, v := range perSeg {
-			sm, err := GetSegmentTx(tx, TierCold, id)
+		for sid, v := range perSeg {
+			sm, err := GetSegmentTx(tx, TierCold, sid)
 			if err != nil {
 				return err
 			}
 			if sm == nil {
-				sm = &SegmentMeta{ID: id, Tier: TierCold, CreatedAt: time.Now().UnixNano()}
+				sm = &SegmentMeta{ID: sid, Tier: TierCold, CreatedAt: time.Now().UnixNano()}
 			}
 			sm.Total += v.total
 			sm.Live += v.live
@@ -348,7 +367,7 @@ func (c *Compactor) replicateOne(rel string) error {
 			}
 		}
 		fm2.Version++
-		return PutFileTx(tx, fm2)
+		return putInodeTx(tx, id, fm2)
 	})
 	if err == errVersionChanged {
 		c.dbg.log("Replicate %q: version changed mid-flight, aborting", rel)
@@ -538,20 +557,18 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 		return
 	}
 
-	// Find all rels referencing this segment.
-	var refs []string
+	// Find all inodes referencing this segment. Walk by inodeID — fm.Rel
+	// can become stale across hardlink unlink and rename, so re-resolving
+	// via paths[fm.Rel] later would silently skip the inode and the source
+	// segment would be unlinked without relocating its fragments.
+	var refs []uint64
 	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
-		cur := tx.Bucket(bucketInodes).Cursor()
-		for k, v := cur.First(); k != nil; k, v = cur.Next() {
-			fm, err := decodeFileMeta(v)
-			if err != nil {
-				return err
-			}
+		return iterateInodesTx(tx, func(id uint64, fm *FileMeta) error {
 			if referencesSegment(fm, tier, target.ID) {
-				refs = append(refs, fm.Rel)
+				refs = append(refs, id)
 			}
-		}
-		return nil
+			return nil
+		})
 	})
 	if err != nil {
 		log.Printf("place: gc: scan refs: %v", err)
@@ -560,14 +577,14 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 
 	// For each ref, read its live fragments on this segment, rewrite to
 	// active, update meta.
-	for _, rel := range refs {
+	for _, id := range refs {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
 		}
-		if err := c.rewriteRefs(rel, tier, target.ID, oldSeg, set); err != nil {
-			log.Printf("place: gc rewrite %q: %v", rel, err)
+		if err := c.rewriteRefs(id, tier, target.ID, oldSeg, set); err != nil {
+			log.Printf("place: gc rewrite inode %d: %v", id, err)
 			return
 		}
 	}
@@ -618,14 +635,24 @@ func referencesSegment(fm *FileMeta, tier Tier, segID uint32) bool {
 	return false
 }
 
-func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Segment, set *SegmentSet) error {
-	fm, err := c.meta.GetFile(rel)
+func (c *Compactor) rewriteRefs(id uint64, tier Tier, segID uint32, oldSeg *Segment, set *SegmentSet) error {
+	var fm *FileMeta
+	err := c.meta.ViewLocked(func(tx *bolt.Tx) error {
+		got, e := getInodeTx(tx, id)
+		fm = got
+		return e
+	})
 	if err != nil {
 		return err
 	}
 	if fm == nil {
+		// Inode was deleted between scan and rewrite. The unlink path
+		// already credited the segment's Live count downward, so the
+		// segment is safe to remove without us relocating anything for
+		// this inode.
 		return nil
 	}
+	rel := fm.Rel
 	list := fm.HotFragments
 	if tier == TierCold {
 		list = fm.ColdFragments
@@ -676,8 +703,10 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		news = append(news, newLoc{old: f, newID: seg.id, newOff: segOff, recSize: recSize})
 	}
 	// Swap in new locations under a transaction; abort if Version changed.
+	// Look up by inodeID — a path mutation between scan and now (rename,
+	// hardlink unlink) must not be misread as "file gone".
 	return c.meta.UpdateLocked(func(tx *bolt.Tx) error {
-		cur, err := GetFileTx(tx, rel)
+		cur, err := getInodeTx(tx, id)
 		if err != nil {
 			return err
 		}
@@ -728,13 +757,13 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 		// just appended. Without this, reconcile-at-restart could see the
 		// active segment file longer than its SegmentMeta.Total and
 		// truncate it, dropping the relocated bytes.
-		for id, v := range addPerSeg {
-			sm, err := GetSegmentTx(tx, tier, id)
+		for sid, v := range addPerSeg {
+			sm, err := GetSegmentTx(tx, tier, sid)
 			if err != nil {
 				return err
 			}
 			if sm == nil {
-				sm = &SegmentMeta{ID: id, Tier: tier, CreatedAt: time.Now().UnixNano()}
+				sm = &SegmentMeta{ID: sid, Tier: tier, CreatedAt: time.Now().UnixNano()}
 			}
 			sm.Total += v.total
 			sm.Live += v.live
@@ -743,6 +772,6 @@ func (c *Compactor) rewriteRefs(rel string, tier Tier, segID uint32, oldSeg *Seg
 			}
 		}
 		cur.Version++
-		return PutFileTx(tx, cur)
+		return putInodeTx(tx, id, cur)
 	})
 }
