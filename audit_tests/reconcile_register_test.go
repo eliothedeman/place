@@ -197,7 +197,7 @@ func TestReconcilePartialTruncationKeepsPrefix(t *testing.T) {
 			SegmentOffset: segOff,
 		}}
 		fm.Size = int64(len(payload))
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	}); err != nil {
 		t.Fatal(err)
 	}

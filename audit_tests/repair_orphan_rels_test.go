@@ -40,7 +40,7 @@ func TestRepairOrphanRels(t *testing.T) {
 		}
 		fm2, _ := place.GetFileTx(tx, "foo")
 		fm2.Nlink = 2
-		return place.PutFileTx(tx, fm2)
+		return place.PutFileTx(meta, tx, fm2)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestRepairOrphanRels(t *testing.T) {
 		fm2, _ := place.GetFileTx(tx, "bar")
 		fm2.Nlink = 1
 		fm2.Rel = "foo"
-		return place.PutFileTx(tx, fm2)
+		return place.PutFileTx(meta, tx, fm2)
 	})
 	if err != nil {
 		t.Fatal(err)

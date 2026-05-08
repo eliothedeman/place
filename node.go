@@ -165,7 +165,7 @@ func (n *placeNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAt
 		}
 		fm.Version++
 		attrFromMeta(fm, &out.Attr)
-		return PutFileTx(tx, fm)
+		return PutFileTx(r.meta, tx, fm)
 	})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {
@@ -236,7 +236,7 @@ func (n *placeNode) Create(ctx context.Context, name string, flags uint32, mode 
 				// the version-changed check rather than racing past us.
 				existing.ColdDirty = true
 				existing.Version++
-				if err := PutFileTx(tx, existing); err != nil {
+				if err := PutFileTx(r.meta, tx, existing); err != nil {
 					return err
 				}
 			}
@@ -255,7 +255,7 @@ func (n *placeNode) Create(ctx context.Context, name string, flags uint32, mode 
 			fm.Uid = caller.Uid
 			fm.Gid = caller.Gid
 		}
-		return PutFileTx(tx, fm)
+		return PutFileTx(r.meta, tx, fm)
 	})
 	if err != nil {
 		done(fs_errno(err))
@@ -311,7 +311,7 @@ func (n *placeNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 			cur.Ctime = cur.Mtime
 			cur.ColdDirty = true
 			cur.Version++
-			return PutFileTx(tx, cur)
+			return PutFileTx(r.meta, tx, cur)
 		})
 		if err != nil {
 			if errno, ok := err.(syscall.Errno); ok {
@@ -355,7 +355,7 @@ func (n *placeNode) Mkdir(ctx context.Context, name string, mode uint32, out *fu
 		if existing != nil {
 			return syscall.EEXIST
 		}
-		return PutFileTx(tx, fm)
+		return PutFileTx(r.meta, tx, fm)
 	})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {
@@ -509,7 +509,7 @@ func (n *placeNode) Symlink(ctx context.Context, target, name string, out *fuse.
 		if existing != nil {
 			return syscall.EEXIST
 		}
-		return PutFileTx(tx, fm)
+		return PutFileTx(r.meta, tx, fm)
 	})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {

@@ -221,7 +221,10 @@ func migrateV0ToV1(tx *bolt.Tx) error {
 		// PutFileTx allocates a fresh inodeID via _meta/next_inode_id and
 		// writes both buckets. fm.Nlink defaults to 1 when not set; v1
 		// records had no Nlink so decodeFileMeta already filled it in.
-		if err := PutFileTx(tx, fm); err != nil {
+		// nil Meta: this is a one-shot tx-body migration with no Meta in
+		// scope, and the stale-inode drop branch can't fire on legacy
+		// records (decodeFileMeta doesn't populate InodeID from v0 keys).
+		if err := PutFileTx(nil, tx, fm); err != nil {
 			return fmt.Errorf("write inode for %q: %w", rel, err)
 		}
 		moved++

@@ -62,7 +62,7 @@ func TestRenameSameInodeLosesPath(t *testing.T) {
 		}
 		fm, _ := place.GetFileTx(tx, "a")
 		fm.Nlink = 2
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)

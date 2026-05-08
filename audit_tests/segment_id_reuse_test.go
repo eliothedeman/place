@@ -95,7 +95,7 @@ func TestSegmentIDReuseAfterCrash_NoReuse(t *testing.T) {
 					{LogicalOffset: 0, Length: 4, Tier: place.TierHot, SegmentID: 5, SegmentOffset: 0},
 				},
 			}
-			return place.PutFileTx(tx, fm)
+			return place.PutFileTx(meta, tx, fm)
 		})
 		if err != nil {
 			t.Fatal(err)

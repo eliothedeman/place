@@ -117,7 +117,7 @@ func TestForwardCompactHardlinkUnlinkPreservesData(t *testing.T) {
 			return err
 		}
 		fm.Nlink = 2
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +324,7 @@ func TestRenameRaceLeavesValidRel(t *testing.T) {
 			return syscall.ENOENT
 		}
 		fm.Rel = "bar"
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)

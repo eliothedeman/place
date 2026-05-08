@@ -91,7 +91,7 @@ func TestConcurrentHardlinkWritesLoseData(t *testing.T) {
 			return err
 		}
 		fm2.Nlink = 2
-		return place.PutFileTx(tx, fm2)
+		return place.PutFileTx(meta, tx, fm2)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestSequentialHardlinkWritesShareOverlay(t *testing.T) {
 		}
 		fm2, _ := place.GetFileTx(tx, "x")
 		fm2.Nlink = 2
-		return place.PutFileTx(tx, fm2)
+		return place.PutFileTx(meta, tx, fm2)
 	})
 	if err != nil {
 		t.Fatal(err)

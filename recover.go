@@ -294,7 +294,7 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 					fm.Size = logOff + int64(payloadLen)
 				}
 				fm.Version++
-				return PutFileTx(tx, fm)
+				return PutFileTx(meta, tx, fm)
 			})
 			if err != nil {
 				return fmt.Errorf("rebuild put %q: %w", rel, err)
@@ -347,7 +347,7 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 					return err
 				}
 				if p == nil {
-					if err := PutFileTx(tx, &FileMeta{Rel: parent, Mode: 0o40755}); err != nil {
+					if err := PutFileTx(meta, tx, &FileMeta{Rel: parent, Mode: 0o40755}); err != nil {
 						return err
 					}
 				}

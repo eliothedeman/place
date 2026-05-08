@@ -185,7 +185,7 @@ func TestOverwriteAfterReplicateThenEvict(t *testing.T) {
 			return err
 		}
 		fm.Version++
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatalf("simulate replicate: %v", err)
@@ -248,7 +248,7 @@ func TestOverwriteAfterReplicateThenEvict(t *testing.T) {
 		}
 		fm.HotFragments = nil
 		fm.Version++
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -320,7 +320,7 @@ func TestOverwriteFullFileThenEvict(t *testing.T) {
 		sm.Live += int64(N)
 		_ = place.PutSegmentTx(tx, sm)
 		fm.Version++
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -359,7 +359,7 @@ func TestOverwriteFullFileThenEvict(t *testing.T) {
 		_ = place.AddLiveBytesTx(meta, tx, dead, -1)
 		fm.HotFragments = nil
 		fm.Version++
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,8 @@ package audit_tests
 
 import (
 	"bytes"
+	"log"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -11,27 +13,49 @@ import (
 	"github.com/eliothedeman/place"
 )
 
-// TestPutFileTxSilentlyDropsStaleInodeUpdate exercises the silent-drop
-// branch in meta.go:619-625. PutFileTx is invoked with a FileMeta whose
-// path has been removed from bbolt and whose InodeID points at an inode
-// that no longer exists. The function returns nil — the caller has no way
-// to tell the data was dropped.
+// TestPutFileTxSurfacesStaleInodeDrop pins the operator-visible surface for
+// PutFileTx's stale-inode drop branch. Pre-fix the branch was silent: a
+// FileMeta whose path was concurrently removed AND whose InodeID no longer
+// resolved to an inode entry was dropped on the floor with no log line and
+// no counter — so a writer-overlay flush after an unlink-and-collect cycle
+// silently lost the user's most recent write, with no signal until a later
+// audit (or, in practice, never).
 //
-// In production this branch fires whenever the writer's overlay flushes
-// after a concurrent unlink-and-collect cycle (e.g. last-link unlink,
-// then GC of the inode entry). The Writer's commitBatch logged success
-// to the user before the flush, so the user's perception of "write
-// landed" is divorced from durability.
+// Post-fix:
+//   - Meta.PutFileDropped() bumps once per drop so tests and operators can
+//     assert (or alert on) drift.
+//   - A log line per drop fires with (rel, inodeID) so the cause is
+//     traceable in production logs.
 //
-// Severity: latent / data-loss-detection-failure.
-func TestPutFileTxSilentlyDropsStaleInodeUpdate(t *testing.T) {
+// The drop semantic is unchanged — re-allocating a fresh inode would
+// resurrect a deleted file under a new identity, which is worse than
+// dropping. The fix is observability, not behaviour.
+func TestPutFileTxSurfacesStaleInodeDrop(t *testing.T) {
 	hot, _ := dirs(t)
 	meta := openMeta(t, hot)
 	defer meta.Close()
 
+	// Baseline: clean state has no drops.
+	if got := meta.PutFileDropped(); got != 0 {
+		t.Fatalf("baseline PutFileDropped: got %d want 0", got)
+	}
+
+	// Capture log output so we can assert the operator-visible message
+	// fires alongside the counter bump. Restore on exit so we don't leak
+	// a buffer-redirected logger to other tests in the package.
+	var logBuf bytes.Buffer
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+
 	// Build a FileMeta carrying an InodeID that does not exist in bbolt.
-	// fm.Rel also doesn't exist as a path. PutFileTx's silent-drop branch
-	// matches exactly this state.
+	// fm.Rel also doesn't exist as a path. PutFileTx's stale-inode drop
+	// branch matches exactly this state.
 	fm := &place.FileMeta{
 		Rel:     "ghost",
 		InodeID: 9999, // never allocated
@@ -44,20 +68,90 @@ func TestPutFileTxSilentlyDropsStaleInodeUpdate(t *testing.T) {
 		}},
 	}
 	err := meta.UpdateLocked(func(tx *bolt.Tx) error {
-		return place.PutFileTx(tx, fm)
+		return place.PutFileTx(meta, tx, fm)
 	})
 	if err != nil {
-		t.Fatalf("PutFileTx returned error %v; expected nil (silent drop)", err)
+		t.Fatalf("PutFileTx returned error %v; expected nil (drop is OK, just must be surfaced)", err)
 	}
 
-	// Read-back: nothing was written. Caller has no signal.
+	// Counter must bump exactly once on the drop.
+	if got := meta.PutFileDropped(); got != 1 {
+		t.Fatalf("PutFileDropped after one stale-inode call: got %d want 1 "+
+			"— pre-fix this counter didn't exist; the drop was silent and the "+
+			"writer's user-visible-success was divorced from durability.", got)
+	}
+
+	// Log line must fire so production logs name the dropped path/inode.
+	logged := logBuf.String()
+	if !strings.Contains(logged, `PutFileTx`) ||
+		!strings.Contains(logged, `rel="ghost"`) ||
+		!strings.Contains(logged, `inodeID=9999`) {
+		t.Errorf("expected drop log line naming rel and inodeID; got %q", logged)
+	}
+
+	// Read-back: drop semantic is unchanged — nothing was written.
 	got := readFile(t, meta, "ghost")
 	if got != nil {
 		t.Fatalf("expected ghost to be absent (drop), got %+v", got)
 	}
-	t.Logf("BUG CONFIRMED: PutFileTx returned nil but stored nothing; "+
-		"a writer flushing this fm would silently lose the user's data. "+
-		"Fragments=%v Size=%d", fm.HotFragments, fm.Size)
+
+	// A second identical call bumps the counter again — every drop is
+	// observable, no rate-limiting / dedup.
+	if err := meta.UpdateLocked(func(tx *bolt.Tx) error {
+		return place.PutFileTx(meta, tx, fm)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := meta.PutFileDropped(); got != 2 {
+		t.Errorf("PutFileDropped after second drop call: got %d want 2", got)
+	}
+}
+
+// TestPutFileTxNoDropsOnCleanFlow asserts the counter stays at zero across a
+// normal create→write→flush→unlink flow. If clean operation produces any
+// drops, the counter is useless as a signal — every legitimate run would
+// already be noisy. The drop branch only fires under writer-overlay racing
+// with concurrent unlink-and-collect, which a single-threaded test never
+// reaches.
+func TestPutFileTxNoDropsOnCleanFlow(t *testing.T) {
+	hot, _ := dirs(t)
+	meta := openMeta(t, hot)
+	defer meta.Close()
+	hotSegs := newHot(t, hot, 1<<30)
+	defer hotSegs.CloseAll()
+
+	w := place.NewWriter(hotSegs, meta, nil)
+	defer w.Close()
+
+	now := time.Now().UnixNano()
+	if err := meta.PutFile(&place.FileMeta{
+		Rel: "f", Mode: syscall.S_IFREG | 0o644,
+		Mtime: now, Ctime: now, Atime: now, Nlink: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Submit("f", 0, []byte("hello world")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.UpdateLocked(func(tx *bolt.Tx) error {
+		fm, err := place.GetFileTx(tx, "f")
+		if err != nil {
+			return err
+		}
+		if err := place.AddLiveBytesTx(meta, tx, fm.HotFragments, -1); err != nil {
+			return err
+		}
+		return place.DeleteFileTx(tx, "f")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := meta.PutFileDropped(); got != 0 {
+		t.Errorf("clean create+write+unlink flow produced %d drop(s); counter is supposed to stay at 0 in clean operation", got)
+	}
 }
 
 // TestAddLiveBytesTxSurfacesMissingSegmentSkip pins the operator-visible

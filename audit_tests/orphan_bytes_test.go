@@ -48,7 +48,7 @@ func TestCreateThenWriteThenCrashLosesFile(t *testing.T) {
 	// Create "newfile" via UpdateLocked (mirrors node.go:Create's tx body).
 	now := time.Now().UnixNano()
 	err := meta.UpdateLocked(func(tx *bolt.Tx) error {
-		return place.PutFileTx(tx, &place.FileMeta{
+		return place.PutFileTx(meta, tx, &place.FileMeta{
 			Rel: "newfile", Mode: syscall.S_IFREG | 0o644,
 			Mtime: now, Ctime: now, Atime: now, Nlink: 1,
 		})
@@ -196,7 +196,7 @@ func TestUpdateLockedSyncFsyncsBeforeReturn(t *testing.T) {
 	mkOp := func(rel string) func(*bolt.Tx) error {
 		now := time.Now().UnixNano()
 		return func(tx *bolt.Tx) error {
-			return place.PutFileTx(tx, &place.FileMeta{
+			return place.PutFileTx(meta, tx, &place.FileMeta{
 				Rel: rel, Mode: syscall.S_IFREG | 0o644,
 				Mtime: now, Ctime: now, Atime: now, Nlink: 1,
 			})

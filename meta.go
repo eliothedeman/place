@@ -288,6 +288,17 @@ type Meta struct {
 	// will eventually surface "segment N missing" EIO. Operators get a log
 	// line per skip; tests assert this stays at 0 in clean scenarios.
 	addLiveSkipped atomic.Int64
+
+	// putFileDropped counts PutFileTx calls whose stale-inode branch fired:
+	// fm.InodeID was non-zero (i.e. the FileMeta had been previously loaded
+	// from bbolt) but neither paths[fm.Rel] nor inodes[fm.InodeID] still
+	// resolved by the time the tx ran. The branch is intentional defensive
+	// logic — the writer's overlay can flush after a concurrent unlink, and
+	// re-creating a fresh inode would resurrect a deleted file under a new
+	// identity — but the silent return masks any other bug producing the
+	// same state. Operators get a log line per drop; tests assert this stays
+	// at 0 in clean scenarios.
+	putFileDropped atomic.Int64
 }
 
 func NewMeta(path string) (*Meta, error) {
@@ -331,7 +342,11 @@ func NewMeta(path string) (*Meta, error) {
 			return nil
 		}
 		now := time.Now().UnixNano()
-		return PutFileTx(tx, &FileMeta{
+		// nil Meta here: the *Meta we'd pass doesn't exist yet — we're
+		// inside NewMeta bootstrapping the root inode. The drop branch
+		// can't fire on a fresh root anyway (fm.InodeID==0), so the nil
+		// is purely a constructor-ordering concession.
+		return PutFileTx(nil, tx, &FileMeta{
 			Rel:   "",
 			Mode:  syscall.S_IFDIR | 0755,
 			Mtime: now,
@@ -909,7 +924,16 @@ func movePathTx(tx *bolt.Tx, oldRel, newRel string) error {
 // PutFileTx writes FileMeta within an active transaction. If the path is new
 // it allocates a fresh inodeID (and sets fm.Nlink=1). Updates to an existing
 // path go to the same inode and preserve its Nlink.
-func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
+//
+// If fm.InodeID is non-zero AND paths[fm.Rel] is missing AND inodes[fm.InodeID]
+// is also gone, the call returns nil without writing — the inode was unlinked
+// out from under a writer that had already loaded it (e.g. the overlay flushing
+// after a concurrent unlink-and-collect cycle). Re-allocating a fresh inode
+// would resurrect a deleted file under a new identity, so the drop is
+// semantically correct; m.putFileDropped is bumped and a log line fires so
+// the drop is observable. m may be nil for legacy / test call sites that
+// don't have a Meta handle in scope; logging still fires.
+func PutFileTx(m *Meta, tx *bolt.Tx, fm *FileMeta) error {
 	id, err := inodeForPathTx(tx, fm.Rel)
 	if err != nil {
 		return err
@@ -926,6 +950,10 @@ func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
 			if ib != nil && ib.Get(inodeKey(fm.InodeID)) != nil {
 				id = fm.InodeID
 			} else {
+				log.Printf("place: PutFileTx: dropping stale update for rel=%q inodeID=%d (path absent and inode gone)", fm.Rel, fm.InodeID)
+				if m != nil {
+					m.putFileDropped.Add(1)
+				}
 				return nil // inode gone — silently drop the stale update
 			}
 		} else {
@@ -1025,7 +1053,7 @@ func DeleteFileTx(tx *bolt.Tx, rel string) error {
 
 // PutFile writes a single FileMeta in its own transaction.
 func (m *Meta) PutFile(fm *FileMeta) error {
-	return m.db.Update(func(tx *bolt.Tx) error { return PutFileTx(tx, fm) })
+	return m.db.Update(func(tx *bolt.Tx) error { return PutFileTx(m, tx, fm) })
 }
 
 // DirChildren returns direct children of parent (excluding parent itself).
@@ -1228,6 +1256,12 @@ func AddLiveBytesTx(m *Meta, tx *bolt.Tx, frags []Fragment, delta int64) error {
 // assert clean operation has zero skips, and to assert a deliberately-
 // constructed missing-segment scenario surfaces exactly one skip.
 func (m *Meta) AddLiveSkipped() int64 { return m.addLiveSkipped.Load() }
+
+// PutFileDropped returns the number of times PutFileTx took its stale-inode
+// drop branch (path missing and inode gone). Test-only — used by audit_tests
+// to assert clean operation has zero drops, and to assert a deliberately-
+// constructed stale-inode scenario surfaces exactly one drop.
+func (m *Meta) PutFileDropped() int64 { return m.putFileDropped.Load() }
 
 // --- encoding ---
 
