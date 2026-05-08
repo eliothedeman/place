@@ -7,6 +7,14 @@ import "sort"
 // the displaced ranges returned as `dead`. The returned `merged` list is
 // sorted by LogicalOffset and non-overlapping.
 func mergeFragment(existing []Fragment, n Fragment) (merged, dead []Fragment) {
+	// Zero-length fragments cover no bytes — splicing one in would just
+	// bloat the list (the fast path appends unconditionally; the slow
+	// path inserts it as a real entry too). Drop them as a structural
+	// invariant. Writer.Submit already short-circuits len(data)==0, this
+	// is defense in depth for any other caller.
+	if n.Length == 0 {
+		return existing, nil
+	}
 	newStart := n.LogicalOffset
 	newEnd := n.End()
 

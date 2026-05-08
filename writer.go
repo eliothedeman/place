@@ -100,6 +100,13 @@ func (w *Writer) SetCompactor(c *Compactor) {
 // Submit sends a write request; blocks until the commit batch replies. The
 // reply means "visible to subsequent reads"; durability requires Flush.
 func (w *Writer) Submit(rel string, logicalOff int64, data []byte) error {
+	// Zero-length writes are no-ops: nothing to append to the segment, and
+	// recording a zero-length Fragment would just bloat the file's fragment
+	// list without ever covering a byte. Drop them at the front door before
+	// they hit the commit batch / mergeFragment.
+	if len(data) == 0 {
+		return nil
+	}
 	if w.ev != nil {
 		if err := w.ev.Admit(int64(len(data))); err != nil {
 			return err
