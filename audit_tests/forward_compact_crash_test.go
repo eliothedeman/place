@@ -137,7 +137,7 @@ func TestGCForwardCompactOrdering_RelocationsDurableBeforeUnlink(t *testing.T) {
 	// seg `target` has only alive's small fragment alive — > 30% dead,
 	// triggering forward-compact.
 	err = meta.UpdateLocked(func(tx *bolt.Tx) error {
-		if err := place.AddLiveBytesTx(tx, fmKilled.HotFragments, -1); err != nil {
+		if err := place.AddLiveBytesTx(meta, tx, fmKilled.HotFragments, -1); err != nil {
 			return err
 		}
 		return place.DeleteFileTx(tx, "killed")

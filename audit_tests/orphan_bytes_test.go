@@ -146,7 +146,7 @@ func TestUnlinkBeforeFsyncResurrectsFile(t *testing.T) {
 		if fm == nil {
 			return syscall.ENOENT
 		}
-		if err := place.AddLiveBytesTx(tx, fm.HotFragments, -1); err != nil {
+		if err := place.AddLiveBytesTx(meta, tx, fm.HotFragments, -1); err != nil {
 			return err
 		}
 		return place.DeleteFileTx(tx, "doomed")

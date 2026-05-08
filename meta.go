@@ -279,6 +279,15 @@ type Meta struct {
 	// "fsync'd" from "kernel-page-cache-visible-but-not-durable" within a
 	// single process.
 	flushCount atomic.Int64
+
+	// addLiveSkipped counts AddLiveBytesTx fragments whose target segment
+	// was missing at credit time. Skipping is intentional in narrow cases
+	// (e.g. fragment refers to a segment GC'd a moment earlier), but every
+	// skip is a lost Live-byte credit; if this counter walks up under steady
+	// state, fragments are accumulating against ghost segments and reads
+	// will eventually surface "segment N missing" EIO. Operators get a log
+	// line per skip; tests assert this stays at 0 in clean scenarios.
+	addLiveSkipped atomic.Int64
 }
 
 func NewMeta(path string) (*Meta, error) {
@@ -787,10 +796,13 @@ func RenameTx(tx *bolt.Tx, oldRel, newRel string) error {
 				return syscall.EISDIR
 			}
 			if existing.Nlink <= 1 {
-				if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
+				// nil Meta here: RenameTx doesn't have a *Meta in scope
+				// (it's a free tx-body helper). The skip-log still fires;
+				// the counter just isn't bumped from this call site.
+				if err := AddLiveBytesTx(nil, tx, existing.HotFragments, -1); err != nil {
 					return err
 				}
-				if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
+				if err := AddLiveBytesTx(nil, tx, existing.ColdFragments, -1); err != nil {
 					return err
 				}
 			}
@@ -1167,7 +1179,19 @@ func (m *Meta) ListSegments(tier Tier) ([]*SegmentMeta, error) {
 
 // AddLiveBytesTx adjusts live-byte counters for a set of fragments.
 // delta is applied per fragment.Length to each fragment's segment.
-func AddLiveBytesTx(tx *bolt.Tx, frags []Fragment, delta int64) error {
+//
+// If a fragment refers to a SegmentMeta that no longer exists (e.g. the
+// segment was just GC'd), the credit is dropped: the skip is logged and
+// (when m is non-nil) m.addLiveSkipped is bumped so operators / tests can
+// observe drift. Erroring out instead would force callers to handle a
+// fundamentally racy condition that's expected during concurrent GC; the
+// counter+log surfaces the loss without breaking the unwind path. A
+// counter that walks up under steady state means fragments are
+// accumulating against ghost segments and reads will eventually surface
+// "segment N missing" EIO — that's a real bug and the log noise is the
+// signal. m may be nil for legacy / test call sites that don't have a
+// Meta handle in scope; logging still fires.
+func AddLiveBytesTx(m *Meta, tx *bolt.Tx, frags []Fragment, delta int64) error {
 	type key struct {
 		tier Tier
 		id   uint32
@@ -1182,6 +1206,10 @@ func AddLiveBytesTx(tx *bolt.Tx, frags []Fragment, delta int64) error {
 			return err
 		}
 		if sm == nil {
+			log.Printf("place: AddLiveBytesTx: skipping missing segment %d (tier=%d), %d bytes credit lost", k.id, k.tier, d)
+			if m != nil {
+				m.addLiveSkipped.Add(1)
+			}
 			continue
 		}
 		sm.Live += d
@@ -1194,6 +1222,12 @@ func AddLiveBytesTx(tx *bolt.Tx, frags []Fragment, delta int64) error {
 	}
 	return nil
 }
+
+// AddLiveSkipped returns the number of times AddLiveBytesTx skipped a
+// fragment whose segment was missing. Test-only — used by audit_tests to
+// assert clean operation has zero skips, and to assert a deliberately-
+// constructed missing-segment scenario surfaces exactly one skip.
+func (m *Meta) AddLiveSkipped() int64 { return m.addLiveSkipped.Load() }
 
 // --- encoding ---
 

@@ -202,7 +202,7 @@ func (e *Evictor) dropCached() int64 {
 				continue
 			}
 			dead := fm.HotFragments
-			if err := AddLiveBytesTx(tx, dead, -1); err != nil {
+			if err := AddLiveBytesTx(e.meta, tx, dead, -1); err != nil {
 				return err
 			}
 			for _, f := range dead {

@@ -152,7 +152,7 @@ func TestForwardCompactHardlinkUnlinkPreservesData(t *testing.T) {
 
 	// Detach killed so its segment crosses the dead threshold.
 	err = meta.UpdateLocked(func(tx *bolt.Tx) error {
-		if err := place.AddLiveBytesTx(tx, fmKilled.HotFragments, -1); err != nil {
+		if err := place.AddLiveBytesTx(meta, tx, fmKilled.HotFragments, -1); err != nil {
 			return err
 		}
 		return place.DeleteFileTx(tx, "killed")
@@ -336,7 +336,7 @@ func TestRenameRaceLeavesValidRel(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = meta.UpdateLocked(func(tx *bolt.Tx) error {
-		if err := place.AddLiveBytesTx(tx, fmKilled.HotFragments, -1); err != nil {
+		if err := place.AddLiveBytesTx(meta, tx, fmKilled.HotFragments, -1); err != nil {
 			return err
 		}
 		return place.DeleteFileTx(tx, "killed")

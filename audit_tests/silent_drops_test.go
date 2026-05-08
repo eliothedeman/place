@@ -60,40 +60,117 @@ func TestPutFileTxSilentlyDropsStaleInodeUpdate(t *testing.T) {
 		"Fragments=%v Size=%d", fm.HotFragments, fm.Size)
 }
 
-// TestAddLiveBytesTxSilentlySkipsMissingSegment exercises meta.go:868.
-// When a fragment references a SegmentMeta that doesn't exist in bbolt,
-// AddLiveBytesTx silently skips it — the per-segment Live counter is
-// never updated, and the caller has no way to know the fragment was
-// orphaned.
+// TestAddLiveBytesTxSurfacesMissingSegmentSkip pins the operator-visible
+// surface for AddLiveBytesTx's missing-segment skip branch. Pre-fix the
+// branch was silent: a fragment referencing a SegmentMeta that didn't
+// exist had its Live credit dropped on the floor with no log line and
+// no counter — so a chain like rebuildMetaFromCold → reconcile → gcPass
+// could happily race a fragment into a Live=0 segment that GC would then
+// unlink, surfacing as "segment N missing" EIO at read time. There was
+// no signal until the EIO.
 //
-// This combines with rebuildMetaFromCold (recover.go:81) which creates
-// fragments to cold seg IDs but never registers SegmentMeta entries.
-// Then reconcile (recover.go:38-60) registers them with Live=0. After
-// that, gcPass (compact.go:430) sees Live==0 + Total>0 and unlinks
-// the cold segment file. The FileMeta still references it — reads
-// surface "segment N missing" EIO.
+// Post-fix:
+//   - Meta.AddLiveSkipped() bumps once per missing-segment skip so tests
+//     and operators can assert (or alert on) drift.
+//   - A log line per skip fires regardless of whether a *Meta is in scope
+//     at the call site (some helpers like RenameTx pass nil).
 //
-// This test demonstrates the silent-skip primitive directly and the
-// full rebuild→reconcile→GC sequence that triggers the data loss.
+// We don't assert log output here — that's environment-dependent and the
+// counter is the contract — but the log line is the operator surface.
 //
-// Severity: data-loss (when --rebuild-meta is used).
-func TestAddLiveBytesTxSilentlySkipsMissingSegment(t *testing.T) {
+// Severity (post-fix): observable. The skip is still semantically correct
+// in narrow cases (segment GC'd a moment earlier), but is no longer silent.
+func TestAddLiveBytesTxSurfacesMissingSegmentSkip(t *testing.T) {
 	hot, _ := dirs(t)
 	meta := openMeta(t, hot)
 	defer meta.Close()
 
-	// Direct demonstration: a fragment to a non-existent seg.
+	// Baseline: clean state has no skips.
+	if got := meta.AddLiveSkipped(); got != 0 {
+		t.Fatalf("baseline AddLiveSkipped: got %d want 0", got)
+	}
+
+	// A fragment to a non-existent seg — the missing-segment branch.
 	frags := []place.Fragment{{
 		LogicalOffset: 0, Length: 100,
 		Tier: place.TierCold, SegmentID: 12345, SegmentOffset: 0,
 	}}
 	err := meta.UpdateLocked(func(tx *bolt.Tx) error {
-		return place.AddLiveBytesTx(tx, frags, -1)
+		return place.AddLiveBytesTx(meta, tx, frags, -1)
 	})
 	if err != nil {
-		t.Fatalf("AddLiveBytesTx returned %v on missing segment; expected nil (silent skip)", err)
+		t.Fatalf("AddLiveBytesTx returned %v on missing segment; expected nil (skip is OK, just must be surfaced)", err)
 	}
-	t.Logf("AddLiveBytesTx silently returned nil for fragment pointing at non-existent seg 12345.")
+	if got := meta.AddLiveSkipped(); got != 1 {
+		t.Fatalf("AddLiveSkipped after one missing-segment call: got %d want 1 "+
+			"— pre-fix this counter didn't exist; the skip was silent and the "+
+			"Live-byte credit was lost without trace.", got)
+	}
+
+	// Two more fragments aggregating to one missing segment + one missing
+	// segment in the same call — the agg map collapses by (tier, id), so
+	// two distinct missing segments produce two skips.
+	frags2 := []place.Fragment{
+		{LogicalOffset: 0, Length: 50, Tier: place.TierCold, SegmentID: 12345, SegmentOffset: 0},
+		{LogicalOffset: 50, Length: 50, Tier: place.TierCold, SegmentID: 12345, SegmentOffset: 50},
+		{LogicalOffset: 100, Length: 50, Tier: place.TierHot, SegmentID: 99999, SegmentOffset: 0},
+	}
+	if err := meta.UpdateLocked(func(tx *bolt.Tx) error {
+		return place.AddLiveBytesTx(meta, tx, frags2, -1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := meta.AddLiveSkipped(); got != 3 {
+		t.Errorf("AddLiveSkipped after second call (2 distinct missing segs): got %d want 3", got)
+	}
+}
+
+// TestAddLiveBytesTxNoSkipsOnCleanFlow asserts the counter stays at zero
+// across a normal write→flush→unlink flow. If clean operation produces
+// any skips, the counter is useless as a signal — every legitimate run
+// would already be noisy.
+func TestAddLiveBytesTxNoSkipsOnCleanFlow(t *testing.T) {
+	hot, _ := dirs(t)
+	meta := openMeta(t, hot)
+	defer meta.Close()
+	hotSegs := newHot(t, hot, 1<<30)
+	defer hotSegs.CloseAll()
+
+	w := place.NewWriter(hotSegs, meta, nil)
+	defer w.Close()
+
+	now := time.Now().UnixNano()
+	if err := meta.PutFile(&place.FileMeta{
+		Rel: "f", Mode: syscall.S_IFREG | 0o644,
+		Mtime: now, Ctime: now, Atime: now, Nlink: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Submit("f", 0, []byte("hello world")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unlink — releases the segment-live-bytes credit through AddLiveBytesTx.
+	// All referenced segments still exist at credit time, so no skips.
+	if err := meta.UpdateLocked(func(tx *bolt.Tx) error {
+		fm, err := place.GetFileTx(tx, "f")
+		if err != nil {
+			return err
+		}
+		if err := place.AddLiveBytesTx(meta, tx, fm.HotFragments, -1); err != nil {
+			return err
+		}
+		return place.DeleteFileTx(tx, "f")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := meta.AddLiveSkipped(); got != 0 {
+		t.Errorf("clean write+unlink flow produced %d skip(s); counter is supposed to stay at 0 in clean operation", got)
+	}
 }
 
 // TestRebuildMetaThenReconcileThenGCDataLoss exercises the full --rebuild-meta

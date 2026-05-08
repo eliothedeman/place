@@ -358,7 +358,7 @@ func (c *Compactor) replicateOne(id uint64) error {
 		if fm2.Version != fm1.Version {
 			return errVersionChanged
 		}
-		if err := AddLiveBytesTx(tx, fm2.ColdFragments, -1); err != nil {
+		if err := AddLiveBytesTx(c.meta, tx, fm2.ColdFragments, -1); err != nil {
 			return err
 		}
 		newCold := make([]Fragment, 0, len(records))
@@ -837,7 +837,7 @@ func (c *Compactor) rewriteRefs(id uint64, tier Tier, segID uint32, oldSeg *Segm
 		// Drop lost fragments from the source segment's Live count so it
 		// can become fully dead and GC can finally remove the file.
 		if len(lostFrags) > 0 {
-			if err := AddLiveBytesTx(tx, lostFrags, -1); err != nil {
+			if err := AddLiveBytesTx(c.meta, tx, lostFrags, -1); err != nil {
 				return err
 			}
 		}

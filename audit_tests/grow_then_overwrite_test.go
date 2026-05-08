@@ -190,7 +190,7 @@ func TestSetattrGrowThenWriteThenReplicateThenOverwriteThenEvict(t *testing.T) {
 			return nil
 		}
 		dead := fm.HotFragments
-		_ = place.AddLiveBytesTx(tx, dead, -1)
+		_ = place.AddLiveBytesTx(meta, tx, dead, -1)
 		fm.HotFragments = nil
 		fm.Version++
 		return place.PutFileTx(tx, fm)

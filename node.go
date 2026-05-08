@@ -154,10 +154,10 @@ func (n *placeNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAt
 				coldKeep, coldDead := truncateFragments(fm.ColdFragments, newSize)
 				fm.HotFragments = hotKeep
 				fm.ColdFragments = coldKeep
-				if err := AddLiveBytesTx(tx, hotDead, -1); err != nil {
+				if err := AddLiveBytesTx(r.meta, tx, hotDead, -1); err != nil {
 					return err
 				}
-				if err := AddLiveBytesTx(tx, coldDead, -1); err != nil {
+				if err := AddLiveBytesTx(r.meta, tx, coldDead, -1); err != nil {
 					return err
 				}
 			}
@@ -220,10 +220,10 @@ func (n *placeNode) Create(ctx context.Context, name string, flags uint32, mode 
 		if existing != nil {
 			// Truncate existing file if O_TRUNC.
 			if flags&syscall.O_TRUNC != 0 {
-				if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
+				if err := AddLiveBytesTx(r.meta, tx, existing.HotFragments, -1); err != nil {
 					return err
 				}
-				if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
+				if err := AddLiveBytesTx(r.meta, tx, existing.ColdFragments, -1); err != nil {
 					return err
 				}
 				existing.HotFragments = nil
@@ -298,10 +298,10 @@ func (n *placeNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 			if cur == nil {
 				return syscall.ENOENT
 			}
-			if err := AddLiveBytesTx(tx, cur.HotFragments, -1); err != nil {
+			if err := AddLiveBytesTx(r.meta, tx, cur.HotFragments, -1); err != nil {
 				return err
 			}
-			if err := AddLiveBytesTx(tx, cur.ColdFragments, -1); err != nil {
+			if err := AddLiveBytesTx(r.meta, tx, cur.ColdFragments, -1); err != nil {
 				return err
 			}
 			cur.HotFragments = nil
@@ -390,10 +390,10 @@ func (n *placeNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		// going away — otherwise the data is still referenced by another
 		// hardlink and segments must keep their fragments live.
 		if fm.Nlink <= 1 {
-			if err := AddLiveBytesTx(tx, fm.HotFragments, -1); err != nil {
+			if err := AddLiveBytesTx(r.meta, tx, fm.HotFragments, -1); err != nil {
 				return err
 			}
-			if err := AddLiveBytesTx(tx, fm.ColdFragments, -1); err != nil {
+			if err := AddLiveBytesTx(r.meta, tx, fm.ColdFragments, -1); err != nil {
 				return err
 			}
 		}

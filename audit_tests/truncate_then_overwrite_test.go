@@ -128,8 +128,8 @@ func TestSetattrTruncateShrinkThenOverwriteThenEvict(t *testing.T) {
 		}
 		fm.HotFragments = hotKeep
 		fm.ColdFragments = coldKeep
-		_ = place.AddLiveBytesTx(tx, hotDead, -1)
-		_ = place.AddLiveBytesTx(tx, coldDead, -1)
+		_ = place.AddLiveBytesTx(meta, tx, hotDead, -1)
+		_ = place.AddLiveBytesTx(meta, tx, coldDead, -1)
 		fm.Size = int64(NewSize)
 		fm.ColdDirty = true // mirrors node.go:Setattr truncate path
 		fm.Version++
@@ -172,7 +172,7 @@ func TestSetattrTruncateShrinkThenOverwriteThenEvict(t *testing.T) {
 			return nil
 		}
 		dead := fm.HotFragments
-		_ = place.AddLiveBytesTx(tx, dead, -1)
+		_ = place.AddLiveBytesTx(meta, tx, dead, -1)
 		fm.HotFragments = nil
 		fm.Version++
 		return place.PutFileTx(tx, fm)

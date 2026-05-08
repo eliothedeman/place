@@ -243,7 +243,7 @@ func TestOverwriteAfterReplicateThenEvict(t *testing.T) {
 			return nil
 		}
 		dead := fm.HotFragments
-		if err := place.AddLiveBytesTx(tx, dead, -1); err != nil {
+		if err := place.AddLiveBytesTx(meta, tx, dead, -1); err != nil {
 			return err
 		}
 		fm.HotFragments = nil
@@ -356,7 +356,7 @@ func TestOverwriteFullFileThenEvict(t *testing.T) {
 			return nil
 		}
 		dead := fm.HotFragments
-		_ = place.AddLiveBytesTx(tx, dead, -1)
+		_ = place.AddLiveBytesTx(meta, tx, dead, -1)
 		fm.HotFragments = nil
 		fm.Version++
 		return place.PutFileTx(tx, fm)
