@@ -460,53 +460,13 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 	newParentRel := newParent.EmbeddedInode().Path(n.Root())
 	newRel := joinRel(newParentRel, newName)
 	done := r.dbg.op("Rename", oldRel, "-> %q", newRel)
+	// All the metadata work lives in RenameTx so the same-inode no-op (and
+	// any future invariants) are exercisable directly from tests without
+	// spinning up a FUSE mount. flags is currently ignored — same as before
+	// — but RENAME_EXCHANGE / RENAME_NOREPLACE would need to be wired
+	// through and the same-inode early return there guarded accordingly.
 	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
-		fm, err := GetFileTx(tx, oldRel)
-		if err != nil {
-			return err
-		}
-		if fm == nil {
-			return syscall.ENOENT
-		}
-		// If destination exists, overwrite it (POSIX rename semantics).
-		// Only release the dst inode's segment-live-bytes credit if we'd
-		// actually be deleting the inode (Nlink would drop to 0).
-		if existing, err := GetFileTx(tx, newRel); err == nil && existing != nil {
-			if existing.IsDir() {
-				return syscall.EISDIR
-			}
-			if existing.Nlink <= 1 {
-				if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
-					return err
-				}
-				if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
-					return err
-				}
-			}
-			if err := DeleteFileTx(tx, newRel); err != nil {
-				return err
-			}
-		}
-		// Directory rename: walk descendants too. Each child path is
-		// repointed to its existing inode.
-		if fm.IsDir() {
-			if err := renameSubtree(tx, oldRel, newRel); err != nil {
-				return err
-			}
-		}
-		// Move the path itself; preserves inodeID (movePathTx also bumps
-		// fm.Rel inside the inode if it was tracking oldRel).
-		if err := movePathTx(tx, oldRel, newRel); err != nil {
-			return err
-		}
-		// Bump ctime/version on the (now-moved) inode.
-		post, err := GetFileTx(tx, newRel)
-		if err != nil || post == nil {
-			return err
-		}
-		post.Ctime = time.Now().UnixNano()
-		post.Version++
-		return putInodeTx(tx, post.InodeID, post)
+		return RenameTx(tx, oldRel, newRel)
 	})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {
@@ -518,44 +478,6 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 	}
 	done(0)
 	return 0
-}
-
-// renameSubtree walks descendants of oldBase under the paths bucket and
-// rewrites their path keys to be rooted at newBase. Inode entries are
-// preserved (movePathTx only changes the paths bucket and updates fm.Rel
-// for the affected inode if applicable). Inode identity is preserved across
-// rename, which is required for hardlinks to behave correctly.
-func renameSubtree(tx *bolt.Tx, oldBase, newBase string) error {
-	cur := tx.Bucket(bucketPaths).Cursor()
-	prefix := childKeyPrefix(oldBase)
-	type pair struct {
-		oldRel string
-		newRel string
-	}
-	var work []pair
-	for k, _ := cur.Seek(prefix); k != nil && hasPrefix(k, prefix); k, _ = cur.Next() {
-		oldRel := keyToRel(k)
-		newRel := newBase + oldRel[len(oldBase):]
-		work = append(work, pair{oldRel, newRel})
-	}
-	for _, p := range work {
-		if err := movePathTx(tx, p.oldRel, p.newRel); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func hasPrefix(b, prefix []byte) bool {
-	if len(b) < len(prefix) {
-		return false
-	}
-	for i := range prefix {
-		if b[i] != prefix[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // --- Symlink / Readlink ---

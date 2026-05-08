@@ -681,6 +681,124 @@ func iterateInodesTx(tx *bolt.Tx, fn func(id uint64, fm *FileMeta) error) error 
 	return nil
 }
 
+// RenameTx implements rename(2)'s metadata mutations: relink paths[oldRel]
+// → inode at paths[newRel], optionally clearing an existing dst, and bump
+// ctime/version on the moved inode. The caller is expected to have already
+// rejected EXDEV at the FUSE layer (different mount).
+//
+// POSIX rename(2) special-cases hardlinks: "If oldpath and newpath are
+// existing hard links referring to the same file, then rename() does
+// nothing, and returns a success status." We handle that with an early
+// return BEFORE any mutation — the previous (buggy) flow would
+// DeleteFileTx(newRel) (decrementing Nlink and dropping the dst path), then
+// movePathTx(oldRel, newRel) (moving the surviving path), losing one
+// hardlink and de-syncing Nlink. This includes rename("a", "a") trivially
+// (same path resolves to the same inodeID).
+//
+// renameSubtree (directory rename: walk descendants) is not part of the tx
+// body here because it depends on a paths-bucket cursor walk that the
+// caller already drives; it stays in node.go alongside Rename.
+func RenameTx(tx *bolt.Tx, oldRel, newRel string) error {
+	oldID, err := inodeForPathTx(tx, oldRel)
+	if err != nil {
+		return err
+	}
+	if oldID == 0 {
+		return syscall.ENOENT
+	}
+	// Same-inode no-op: oldRel and newRel resolve to the same inode (either
+	// because they're the same path, or because they're hardlinks pointing
+	// at the same file). POSIX requires a successful no-op — no mutation,
+	// no ctime/version bump.
+	newID, err := inodeForPathTx(tx, newRel)
+	if err != nil {
+		return err
+	}
+	if oldID == newID {
+		return nil
+	}
+	// Source must exist; load via the inode (we already have the id) so
+	// IsDir / fragment lists are available without re-walking paths.
+	fm, err := getInodeTx(tx, oldID)
+	if err != nil {
+		return err
+	}
+	if fm == nil {
+		return syscall.ENOENT
+	}
+	// If destination exists (newID != 0 here, since same-inode was handled
+	// above), overwrite it. Only release the dst inode's segment-live-bytes
+	// credit if we'd actually be deleting the inode (Nlink would drop to 0).
+	if newID != 0 {
+		existing, err := getInodeTx(tx, newID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			if existing.IsDir() {
+				return syscall.EISDIR
+			}
+			if existing.Nlink <= 1 {
+				if err := AddLiveBytesTx(tx, existing.HotFragments, -1); err != nil {
+					return err
+				}
+				if err := AddLiveBytesTx(tx, existing.ColdFragments, -1); err != nil {
+					return err
+				}
+			}
+			if err := DeleteFileTx(tx, newRel); err != nil {
+				return err
+			}
+		}
+	}
+	// Directory rename: walk descendants too. Each child path is repointed
+	// to its existing inode.
+	if fm.IsDir() {
+		if err := renameSubtreeTx(tx, oldRel, newRel); err != nil {
+			return err
+		}
+	}
+	// Move the path itself; preserves inodeID (movePathTx also bumps fm.Rel
+	// inside the inode if it was tracking oldRel).
+	if err := movePathTx(tx, oldRel, newRel); err != nil {
+		return err
+	}
+	// Bump ctime/version on the (now-moved) inode.
+	post, err := getInodeTx(tx, oldID)
+	if err != nil || post == nil {
+		return err
+	}
+	post.Ctime = time.Now().UnixNano()
+	post.Version++
+	return putInodeTx(tx, oldID, post)
+}
+
+// renameSubtreeTx walks descendants of oldBase under the paths bucket and
+// rewrites their path keys to be rooted at newBase. Inode entries are
+// preserved (movePathTx only changes the paths bucket and updates fm.Rel
+// for the affected inode if applicable). Inode identity is preserved across
+// rename, which is required for hardlinks to behave correctly.
+func renameSubtreeTx(tx *bolt.Tx, oldBase, newBase string) error {
+	cur := tx.Bucket(bucketPaths).Cursor()
+	prefix := childKeyPrefix(oldBase)
+	type pair struct {
+		oldRel string
+		newRel string
+	}
+	var work []pair
+	for k, _ := cur.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cur.Next() {
+		oldRel := keyToRel(k)
+		newRel := newBase + oldRel[len(oldBase):]
+		work = append(work, pair{oldRel, newRel})
+	}
+	for _, p := range work {
+		if err := movePathTx(tx, p.oldRel, p.newRel); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // movePathTx renames paths[oldRel] → paths[newRel], preserving the inodeID.
 // If the inode's fm.Rel is currently oldRel, it's updated to newRel (so
 // cold-record framing uses the up-to-date primary name). Returns ENOENT if
