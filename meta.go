@@ -617,12 +617,18 @@ func getInodeTx(tx *bolt.Tx, id uint64) (*FileMeta, error) {
 
 // putInodeTx writes fm directly to inodes[id] without touching paths. Used
 // by Link, Rename, and helpers that need to update an inode in place.
+//
+// Nlink==0 is an error: encodeFileMeta treats 0 as a deletion marker and
+// silently rewrites it to 1 on the way out, which would resurrect an
+// inode the caller meant to remove. Callers that mean to delete should
+// go through DeleteFileTx (which clears the inode on the last link); a
+// live inode always has Nlink>=1.
 func putInodeTx(tx *bolt.Tx, id uint64, fm *FileMeta) error {
 	if id == 0 {
 		return errors.New("putInodeTx: id=0")
 	}
 	if fm.Nlink == 0 {
-		fm.Nlink = 1
+		return fmt.Errorf("putInodeTx: Nlink=0 for inode %d (use DeleteFileTx to remove)", id)
 	}
 	enc, err := encodeFileMeta(fm)
 	if err != nil {
