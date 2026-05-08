@@ -104,6 +104,23 @@ func readSegMeta(t *testing.T, hot string, tier place.Tier, id uint32) *place.Se
 	return sm
 }
 
+// getSegMeta reads SegmentMeta via the live *place.Meta handle (not a fresh
+// bbolt.Open) so it doesn't deadlock on the file lock when the test still
+// holds an open meta.
+func getSegMeta(t *testing.T, m *place.Meta, tier place.Tier, id uint32) *place.SegmentMeta {
+	t.Helper()
+	var sm *place.SegmentMeta
+	err := m.DB().View(func(tx *bolt.Tx) error {
+		got, e := place.GetSegmentTx(tx, tier, id)
+		sm = got
+		return e
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sm
+}
+
 // readFile returns the FileMeta for rel, or nil.
 func readFile(t *testing.T, m *place.Meta, rel string) *place.FileMeta {
 	t.Helper()

@@ -3,6 +3,7 @@ package place
 import (
 	"fmt"
 	"log"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -78,7 +79,28 @@ func reconcile(meta *Meta, set *SegmentSet) error {
 // rebuildMetaFromCold walks cold segment records and reconstructs the files
 // bucket. Use when bbolt has been lost. Hot segments are ignored; hot
 // coverage will be empty until the user re-writes files.
+//
+// Limitations of the cold record format that this rebuild cannot recover:
+//   - Mode bits — every restored file gets 0o100644 (regular 0644). Exec,
+//     setuid, setgid bits are lost. TODO(rebuild-meta): add a record-format
+//     extension that carries Mode so binaries restore executable.
+//   - Hardlinks — each rel becomes its own inode, so two paths that
+//     pre-rebuild shared an inode resurface as independent files with their
+//     own copies. TODO(rebuild-meta): hardlinks require an inodeID in the
+//     record header.
+//   - Deletions — a path that was deleted but whose cold records are still
+//     in segments will resurrect on rebuild. Rebuild has no signal that the
+//     records correspond to a since-removed path. TODO(rebuild-meta): a
+//     tombstone record is written today (recordTombstone) but rebuild
+//     doesn't honour it as "drop coverage" yet.
 func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
+	// Per-segment live byte counter. Live starts at 0 and is bumped by every
+	// merged record's payload length, then debited for any range that a
+	// later record supersedes (mergeFragment's `dead` return). Without this
+	// pass, reconcile registers each cold seg with Live=0 and the first GC
+	// tick unlinks every cold .seg — catastrophic data loss on rebuild.
+	liveBySeg := map[uint32]int64{}
+	totalBySeg := map[uint32]int64{}
 	for _, id := range coldSegs.All() {
 		seg := coldSegs.Get(id)
 		if seg == nil {
@@ -88,6 +110,7 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 		if size == 0 {
 			continue
 		}
+		totalBySeg[id] = size
 		buf := make([]byte, size)
 		if _, err := seg.ReadAt(buf, 0); err != nil {
 			return fmt.Errorf("read segment %d: %w", id, err)
@@ -107,7 +130,7 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 				if fm == nil {
 					fm = &FileMeta{
 						Rel:  rel,
-						Mode: 0o100644, // regular file 0644
+						Mode: 0o100644, // regular file 0644 — see func doc for limitations
 					}
 				}
 				frag := Fragment{
@@ -117,8 +140,16 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 					SegmentID:     id,
 					SegmentOffset: payloadStart,
 				}
-				merged, _ := mergeFragment(fm.ColdFragments, frag)
+				merged, dead := mergeFragment(fm.ColdFragments, frag)
 				fm.ColdFragments = merged
+				// Credit this record's payload as live in its segment, then
+				// debit any earlier coverage it just superseded. Both legs
+				// are required: a segment whose every record is fully
+				// shadowed by a later record correctly drops to Live=0.
+				liveBySeg[id] += int64(payloadLen)
+				for _, d := range dead {
+					liveBySeg[d.SegmentID] -= d.Length
+				}
 				if logOff+int64(payloadLen) > fm.Size {
 					fm.Size = logOff + int64(payloadLen)
 				}
@@ -130,6 +161,36 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 			}
 			off = next
 		}
+	}
+	// Persist a SegmentMeta for every cold segment we walked. Without this,
+	// reconcile (recover.go:reconcile) sees missing entries and registers
+	// Live=0, and gcPass deletes the file at the next tick — see bug #6.
+	now := time.Now().UnixNano()
+	activeID := uint32(0)
+	if a, _ := coldSegs.Active(); a != nil {
+		activeID = a.id
+	}
+	if err := meta.db.Update(func(tx *bolt.Tx) error {
+		for id, total := range totalBySeg {
+			live := liveBySeg[id]
+			if live < 0 {
+				live = 0
+			}
+			sm := &SegmentMeta{
+				ID:        id,
+				Tier:      TierCold,
+				Total:     total,
+				Live:      live,
+				Sealed:    id != activeID,
+				CreatedAt: now,
+			}
+			if err := PutSegmentTx(tx, sm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("rebuild persist segment meta: %w", err)
 	}
 	// Walk directory paths and ensure parents exist.
 	return meta.db.Update(func(tx *bolt.Tx) error {
@@ -155,4 +216,11 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 		}
 		return nil
 	})
+}
+
+// RebuildMetaFromColdForTest is a test-only entry point that runs the
+// production rebuild logic. The audit suite uses it to exercise the real
+// recovery path end-to-end without standing up a full Mount.
+func RebuildMetaFromColdForTest(meta *Meta, coldSegs *SegmentSet) error {
+	return rebuildMetaFromCold(meta, coldSegs)
 }

@@ -464,6 +464,14 @@ func (s *SegmentSet) SetPreRemoveHookForTest(hook func(uint32)) {
 	s.mu.Unlock()
 }
 
+// AppendDataForTest is an exported wrapper around (*Segment).Append for the
+// recordData type. The audit suite uses it to forge cold records that
+// rebuildMetaFromCold then parses, exercising the same byte-format code path
+// as production replicate.
+func (s *Segment) AppendDataForTest(rel string, logicalOff int64, payload []byte) (int64, error) {
+	return s.Append(recordData, rel, logicalOff, payload)
+}
+
 // All returns a snapshot of all segment ids.
 func (s *SegmentSet) All() []uint32 {
 	s.mu.RLock()
