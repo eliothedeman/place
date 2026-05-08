@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -502,29 +501,3 @@ func (s *SegmentSet) CloseAll() error {
 	return firstErr
 }
 
-// RegisterInMeta records a freshly-seen segment in bbolt (creation time, zero
-// live bytes, not sealed). Idempotent.
-func (s *SegmentSet) RegisterInMeta(meta *Meta) error {
-	return meta.db.Update(func(tx *bolt.Tx) error {
-		for id, seg := range s.segments {
-			existing, err := GetSegmentTx(tx, s.tier, id)
-			if err != nil {
-				return err
-			}
-			if existing == nil {
-				sm := &SegmentMeta{
-					ID:        id,
-					Tier:      s.tier,
-					Total:     seg.size,
-					Live:      seg.size, // will be reconciled by recovery if needed
-					Sealed:    s.active != seg,
-					CreatedAt: time.Now().UnixNano(),
-				}
-				if err := PutSegmentTx(tx, sm); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-}

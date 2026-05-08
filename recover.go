@@ -10,6 +10,13 @@ import (
 
 // reconcile aligns segment files on disk with bbolt's view of them.
 //
+// reconcile is the sole production path that registers a SegmentMeta from
+// a .seg file's existence — every other registration goes through the
+// writer/replicate/forwardCompact code paths that already account
+// Total/Live as bytes are appended. Mount calls reconcile after attaching
+// each SegmentSet, so a missing entry here is the only way an
+// already-on-disk segment becomes known to bbolt.
+//
 // For each segment in the set:
 //   - If bbolt has a SegmentMeta, truncate the file to SegmentMeta.Total
 //     (any tail beyond that is orphaned data from a write whose metadata

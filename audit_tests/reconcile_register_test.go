@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -45,19 +47,45 @@ func makeReg(rel string) *place.FileMeta {
 	}
 }
 
-// TestRegisterInMetaIsDeadCode confirms that SegmentSet.RegisterInMeta is
-// never called by any production code path (verified by grep). The function
-// in segment.go:414 is unused. Its docstring claims "creation time, zero
-// live bytes" but the body sets Live=seg.size. If it were ever wired in
-// after reconcile, it would clobber reconcile's Live=0 for orphans, pinning
-// inherited orphan segments forever.
+// TestRegisterInMetaIsRemoved is a regression guard that fails if
+// SegmentSet.RegisterInMeta is reintroduced. The function used to live in
+// segment.go but had no production callers; its body also contradicted its
+// docstring (Live=seg.size vs "zero live bytes"). Re-wiring it after
+// reconcile would clobber reconcile's Live=0 for orphan segments, pinning
+// inherited dead bytes forever.
 //
-// Severity: cosmetic (dead code, misleading doc).
-func TestRegisterInMetaIsDeadCode(t *testing.T) {
-	// This test just documents the inconsistency — there is nothing to
-	// invoke; RegisterInMeta is unreachable from production paths.
-	t.Log("RegisterInMeta in segment.go:414 has Live=seg.size despite the " +
-		"docstring claiming 'zero live bytes'. Currently dead code.")
+// Segment registration today is funnelled exclusively through reconcile
+// (recover.go) and the writer/replicate/forwardCompact paths that account
+// Total/Live alongside the appends.
+func TestRegisterInMetaIsRemoved(t *testing.T) {
+	// Resolve the package directory by walking up from this test file
+	// and grep the package source for the dead identifier. Pure-Go check
+	// so it doesn't depend on a `grep` binary in $PATH.
+	pkgDir, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(pkgDir, e.Name())
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(body, []byte("RegisterInMeta")) {
+			t.Errorf("dead RegisterInMeta identifier reappeared in %s — "+
+				"reconcile is the sole segment-registration path", path)
+		}
+	}
 }
 
 // TestReconcileShorterThanMetaQuarantines verifies the production fix for a
