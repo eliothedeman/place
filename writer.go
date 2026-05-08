@@ -226,6 +226,32 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 
 	err := w.meta.WithOverlay(func() error {
 		now := time.Now().UnixNano()
+		// Credit Total/Live for the new bytes BEFORE the per-request
+		// dead-fragment decrement loop. Two reasons it has to be in
+		// this order:
+		//   1. For a brand-new segment, getSegLocked would otherwise
+		//      return nil during the dead-fragment debit (overlay miss
+		//      + bbolt miss) and the dead-frag debit silently no-ops.
+		//      Phase-after credit then adds the FULL sum of writes
+		//      (including displaced ones) — permanent Live over-count.
+		//   2. With the segment materialised but Live=0, the first
+		//      in-batch displacement debit would drive Live negative
+		//      and the existing clamp would wipe it back to 0 — then
+		//      a later credit re-adds the displaced bytes anyway.
+		// Crediting first means the debits always run against a
+		// non-zero Live that already reflects every record we wrote.
+		for id, total := range segDeltaTotal {
+			sm, err := w.meta.getSegLocked(TierHot, id)
+			if err != nil {
+				return err
+			}
+			if sm == nil {
+				sm = &SegmentMeta{ID: id, Tier: TierHot, CreatedAt: now}
+				w.meta.putSegLocked(sm)
+			}
+			sm.Total += total
+			sm.Live += segDeltaLive[id]
+		}
 		for _, a := range appliedReqs {
 			fm, err := w.meta.getFileLocked(a.req.rel)
 			if err != nil {
@@ -262,18 +288,6 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 			}
 			fm.ColdDirty = true
 			fm.Version++
-		}
-		for id, total := range segDeltaTotal {
-			sm, err := w.meta.getSegLocked(TierHot, id)
-			if err != nil {
-				return err
-			}
-			if sm == nil {
-				sm = &SegmentMeta{ID: id, Tier: TierHot, CreatedAt: now}
-				w.meta.putSegLocked(sm)
-			}
-			sm.Total += total
-			sm.Live += segDeltaLive[id]
 		}
 		return nil
 	})
