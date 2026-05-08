@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -269,6 +271,14 @@ type Meta struct {
 	mu    sync.Mutex
 	files map[uint64]*FileMeta    // overlay entries keyed by inodeID; pointer-shared with callers (under mu)
 	segs  map[segKey]*SegmentMeta // segment-meta overlay
+
+	// flushCount is bumped every time Flush() successfully fsyncs bbolt. The
+	// audit_tests use it to assert that path-altering FUSE ops (Create,
+	// Unlink, …) make their metadata durable before returning, since the
+	// alternative (snapshot-the-on-disk-file) doesn't actually distinguish
+	// "fsync'd" from "kernel-page-cache-visible-but-not-durable" within a
+	// single process.
+	flushCount atomic.Int64
 }
 
 func NewMeta(path string) (*Meta, error) {
@@ -477,6 +487,35 @@ func (m *Meta) UpdateLocked(fn func(tx *bolt.Tx) error) error {
 	})
 }
 
+// UpdateLockedSync runs UpdateLocked and, on tx success, fsyncs bbolt
+// before returning — used by FUSE path-altering ops (Create, Mkdir,
+// Unlink, …) to close the up-to-syncInterval window where a metadata
+// mutation would otherwise be in NoSync limbo. Without this, a
+// Create+Write+power-loss within the writer's syncInterval rolls bbolt
+// back to before the Create — bytes hit the segment file but no FileMeta
+// references them, and reconcile registers the orphan segment with
+// Live=0 → next GC tick drops it. Bytes lost.
+//
+// The cost is one bbolt fsync per metadata op (10s of microseconds on
+// SSD). These ops aren't on the hot write path; the win is bounded
+// metadata-loss exposure for rsync-style workloads that expect
+// close-after-write to be durable.
+//
+// A Sync error after a successful tx is logged, not returned: the tx is
+// in memory and visible to subsequent reads, the next sync (or Close)
+// will catch up, and surfacing it would force the caller to handle a
+// best-effort failure on a syscall that already succeeded. The tx error
+// is returned unchanged.
+func (m *Meta) UpdateLockedSync(fn func(tx *bolt.Tx) error) error {
+	if err := m.UpdateLocked(fn); err != nil {
+		return err
+	}
+	if err := m.Flush(); err != nil {
+		log.Printf("place: meta sync after locked tx: %v", err)
+	}
+	return nil
+}
+
 // ViewLocked is the read-only companion: flush overlay so the view sees
 // committed data, then run fn in a bbolt read tx.
 func (m *Meta) ViewLocked(fn func(tx *bolt.Tx) error) error {
@@ -493,8 +532,17 @@ func (m *Meta) Flush() error {
 	if err := m.flushOverlayLocked(); err != nil {
 		return err
 	}
-	return m.db.Sync()
+	if err := m.db.Sync(); err != nil {
+		return err
+	}
+	m.flushCount.Add(1)
+	return nil
 }
+
+// FlushCount returns the number of successful fsyncs Flush has performed.
+// Test-only — used by audit_tests to assert that path-altering FUSE ops
+// actually call Flush before returning.
+func (m *Meta) FlushCount() int64 { return m.flushCount.Load() }
 
 // FlushNoSync drains the overlay to bbolt without fsyncing. Used by read
 // paths (DirChildren, cursor walks) that need overlay+bbolt to be unified

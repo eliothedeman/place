@@ -115,7 +115,7 @@ var _ = (fs.NodeSetattrer)((*placeNode)(nil))
 func (n *placeNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	r := n.root()
 	rel := n.relPath()
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		fm, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -212,7 +212,7 @@ func (n *placeNode) Create(ctx context.Context, name string, flags uint32, mode 
 	now := time.Now().UnixNano()
 	caller, _ := fuse.FromContext(ctx)
 	var fm *FileMeta
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		existing, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -290,7 +290,7 @@ func (n *placeNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 	}
 	isWrite := flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0
 	if isWrite && flags&syscall.O_TRUNC != 0 {
-		err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+		err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 			cur, err := GetFileTx(tx, rel)
 			if err != nil {
 				return err
@@ -347,7 +347,7 @@ func (n *placeNode) Mkdir(ctx context.Context, name string, mode uint32, out *fu
 		fm.Uid = caller.Uid
 		fm.Gid = caller.Gid
 	}
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		existing, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -375,7 +375,7 @@ func (n *placeNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	r := n.root()
 	rel := joinRel(n.relPath(), name)
 	done := r.dbg.op("Unlink", rel)
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		fm, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -423,7 +423,7 @@ func (n *placeNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if has {
 		return syscall.ENOTEMPTY
 	}
-	err = r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err = r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		fm, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -465,7 +465,7 @@ func (n *placeNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 	// spinning up a FUSE mount. flags is currently ignored — same as before
 	// — but RENAME_EXCHANGE / RENAME_NOREPLACE would need to be wired
 	// through and the same-inode early return there guarded accordingly.
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		return RenameTx(tx, oldRel, newRel)
 	})
 	if err != nil {
@@ -501,7 +501,7 @@ func (n *placeNode) Symlink(ctx context.Context, target, name string, out *fuse.
 		fm.Uid = caller.Uid
 		fm.Gid = caller.Gid
 	}
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		existing, err := GetFileTx(tx, rel)
 		if err != nil {
 			return err
@@ -568,7 +568,7 @@ func (n *placeNode) Link(ctx context.Context, target fs.InodeEmbedder, name stri
 	done := r.dbg.op("Link", newRel, "→ %q", targetRel)
 
 	var fm *FileMeta
-	err := r.meta.UpdateLocked(func(tx *bolt.Tx) error {
+	err := r.meta.UpdateLockedSync(func(tx *bolt.Tx) error {
 		// Resolve target's inodeID.
 		targetID, err := inodeForPathTx(tx, targetRel)
 		if err != nil {
