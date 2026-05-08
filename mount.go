@@ -159,6 +159,16 @@ func Mount(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("reconcile cold: %w", err)
 	}
 
+	// Sweep up any inodes whose fm.Rel was left stale by pre-fix
+	// DeleteFileTx (hardlink unlink of the primary path didn't repoint
+	// Rel). Compaction now reads fm.Rel only after re-fetching via
+	// inodeID, but record framing still uses the stored Rel — repair so
+	// that name resolves back to the inode for clean accounting.
+	if err := RepairOrphanRels(meta); err != nil {
+		meta.Close()
+		return nil, fmt.Errorf("repair orphan rels: %w", err)
+	}
+
 	evictAt := cfg.EvictAt
 	if evictAt == 0 {
 		evictAt = 0.9
