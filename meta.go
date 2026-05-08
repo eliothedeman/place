@@ -24,11 +24,23 @@ var (
 	bucketInodes   = []byte("inodes")   // 8-byte inodeID (LE) → encoded FileMeta
 	bucketSegments = []byte("segments") // unchanged
 	bucketConfig   = []byte("config")   // unchanged
-	bucketMeta     = []byte("_meta")    // schema_version, next_inode_id
+	bucketMeta     = []byte("_meta")    // schema_version, next_inode_id, next_segment_id_*
 
-	metaKeySchemaVersion = []byte("schema_version")
-	metaKeyNextInodeID   = []byte("next_inode_id")
+	metaKeySchemaVersion   = []byte("schema_version")
+	metaKeyNextInodeID     = []byte("next_inode_id")
+	metaKeyNextSegmentIDHot  = []byte("next_segment_id_hot")
+	metaKeyNextSegmentIDCold = []byte("next_segment_id_cold")
 )
+
+// segmentIDKey returns the _meta bucket key for the next-segment-id counter
+// for tier. Per-tier because SegmentKey is (tier, id) — IDs don't collide
+// across tiers, so each tier has an independent monotonic sequence.
+func segmentIDKey(tier Tier) []byte {
+	if tier == TierCold {
+		return metaKeyNextSegmentIDCold
+	}
+	return metaKeyNextSegmentIDHot
+}
 
 // inodeKey encodes a uint64 inodeID as the bbolt key for bucketInodes.
 // 8 bytes, big-endian so cursor iteration is in numeric order.
@@ -62,6 +74,61 @@ func allocInodeID(tx *bolt.Tx) (uint64, error) {
 		return 0, err
 	}
 	return next, nil
+}
+
+// readNextSegmentIDTx returns the persisted next-segment-id counter for tier
+// without mutating it. Returns 0 if never written. Must be called inside a tx.
+func readNextSegmentIDTx(tx *bolt.Tx, tier Tier) (uint32, error) {
+	mb := tx.Bucket(bucketMeta)
+	if mb == nil {
+		return 0, errors.New("missing _meta bucket")
+	}
+	v := mb.Get(segmentIDKey(tier))
+	if v == nil {
+		return 0, nil
+	}
+	if len(v) != 4 {
+		return 0, fmt.Errorf("next_segment_id_%d: bad encoding (%d bytes)", tier, len(v))
+	}
+	return binary.LittleEndian.Uint32(v), nil
+}
+
+// AllocSegmentID reserves and persists the next segment id for tier in its
+// own write tx, syncing bbolt before returning. Mirrors allocInodeID for a
+// crash-safe monotonic counter — the caller can then create the .seg file
+// knowing the id is durably reserved (so a later restart, even one that
+// rolls back to before the .seg file was unlinked, won't reuse it).
+//
+// Caller passes the in-memory floor (max disk id + 1, etc.) so we never
+// regress: persisted = max(persisted, floor) + 1.
+func (m *Meta) AllocSegmentID(tier Tier, floor uint32) (uint32, error) {
+	var id uint32
+	err := m.UpdateLocked(func(tx *bolt.Tx) error {
+		mb := tx.Bucket(bucketMeta)
+		if mb == nil {
+			return errors.New("missing _meta bucket")
+		}
+		next := floor
+		if v := mb.Get(segmentIDKey(tier)); v != nil && len(v) == 4 {
+			if persisted := binary.LittleEndian.Uint32(v); persisted > next {
+				next = persisted
+			}
+		}
+		id = next
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], next+1)
+		return mb.Put(segmentIDKey(tier), buf[:])
+	})
+	if err != nil {
+		return 0, err
+	}
+	// Sync so the reservation survives a crash before the .seg file is
+	// created — otherwise a restart could roll back the counter and reissue
+	// the same id, defeating the whole point.
+	if err := m.db.Sync(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // relKey encodes a rel path as a bbolt key. Every key starts with '/' so

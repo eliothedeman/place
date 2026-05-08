@@ -238,6 +238,13 @@ type SegmentSet struct {
 	segments map[uint32]*Segment
 	active   *Segment
 	nextID   uint32
+	// meta backs nextID with a crash-durable counter in _meta. nil
+	// permitted (tests, rebuild) — the set then derives ids purely from
+	// disk, accepting the bug-#5 reuse risk for those callers.
+	meta *Meta
+	// preRemoveHook is fired by Remove right before the os.Remove call.
+	// Test-only; nil in production.
+	preRemoveHook func(uint32)
 }
 
 func NewSegmentSet(tier Tier, rootPath string, maxSize int64) (*SegmentSet, error) {
@@ -292,6 +299,37 @@ func (s *SegmentSet) loadExisting() error {
 	return nil
 }
 
+// AttachMeta wires the bbolt-backed segment-id counter and reconciles the
+// in-memory floor with the persisted value. After this returns, newActive /
+// RotateIfFull take ids via the durable counter — preventing post-crash
+// reuse of an id whose .seg file was unlinked but whose detaching tx was
+// rolled back. Idempotent; call once at Mount after both Meta and
+// SegmentSet are constructed.
+func (s *SegmentSet) AttachMeta(meta *Meta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meta = meta
+	// Pull the persisted counter and take max(disk-derived, persisted) so
+	// fresh installs (persisted=0) and crash recovery (persisted possibly
+	// > disk_max+1) both produce a safe starting point.
+	var persisted uint32
+	err := meta.db.View(func(tx *bolt.Tx) error {
+		v, err := readNextSegmentIDTx(tx, s.tier)
+		if err != nil {
+			return err
+		}
+		persisted = v
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if persisted > s.nextID {
+		s.nextID = persisted
+	}
+	return nil
+}
+
 func segFileName(id uint32) string {
 	return fmt.Sprintf("%08d.seg", id)
 }
@@ -316,19 +354,49 @@ func (s *SegmentSet) Active() (*Segment, error) {
 
 func (s *SegmentSet) newActive() (*Segment, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.active != nil {
-		return s.active, nil
+		a := s.active
+		s.mu.Unlock()
+		return a, nil
 	}
-	id := s.nextID
-	s.nextID++
+	id, err := s.allocIDLocked()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	seg, err := openSegment(filepath.Join(s.dir, segFileName(id)), id, s.tier)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	s.segments[id] = seg
 	s.active = seg
+	s.mu.Unlock()
 	return seg, nil
+}
+
+// allocIDLocked returns a fresh segment id, reserving it durably in bbolt
+// when a Meta is attached. Caller holds s.mu; we drop it across the bbolt
+// write (which itself takes meta.mu) to preserve the lock order
+// (meta.mu before s.mu) used by the writer path. Re-acquire on return.
+func (s *SegmentSet) allocIDLocked() (uint32, error) {
+	floor := s.nextID
+	if s.meta == nil {
+		// No durable counter wired (test/rebuild path) — fall back to the
+		// disk-derived sequence. Keeps callers that bypass Mount working.
+		s.nextID = floor + 1
+		return floor, nil
+	}
+	s.mu.Unlock()
+	id, err := s.meta.AllocSegmentID(s.tier, floor)
+	s.mu.Lock()
+	if err != nil {
+		return 0, err
+	}
+	if id+1 > s.nextID {
+		s.nextID = id + 1
+	}
+	return id, nil
 }
 
 // RotateIfFull seals the active segment and creates a new one if appending
@@ -349,8 +417,11 @@ func (s *SegmentSet) RotateIfFull(next int64) (*Segment, bool, error) {
 		// scratch buffer so we don't hold 16+ MB per retired segment.
 		a.releaseScratch()
 	}
-	id := s.nextID
-	s.nextID++
+	id, err := s.allocIDLocked()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, false, err
+	}
 	seg, err := openSegment(filepath.Join(s.dir, segFileName(id)), id, s.tier)
 	if err != nil {
 		s.mu.Unlock()
@@ -366,9 +437,10 @@ func (s *SegmentSet) RotateIfFull(next int64) (*Segment, bool, error) {
 // references it any more.
 func (s *SegmentSet) Remove(id uint32) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	hook := s.preRemoveHook
 	seg, ok := s.segments[id]
 	if !ok {
+		s.mu.Unlock()
 		return nil
 	}
 	_ = seg.Close()
@@ -376,7 +448,20 @@ func (s *SegmentSet) Remove(id uint32) error {
 	if s.active == seg {
 		s.active = nil
 	}
+	s.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
 	return os.Remove(filepath.Join(s.dir, segFileName(id)))
+}
+
+// SetPreRemoveHookForTest installs a callback fired immediately before
+// os.Remove unlinks a .seg file. Test-only — used to capture the bbolt
+// state at the exact moment of unlink and assert it's already durable.
+func (s *SegmentSet) SetPreRemoveHookForTest(hook func(uint32)) {
+	s.mu.Lock()
+	s.preRemoveHook = hook
+	s.mu.Unlock()
 }
 
 // All returns a snapshot of all segment ids.

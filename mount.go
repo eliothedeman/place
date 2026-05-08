@@ -130,6 +130,17 @@ func Mount(cfg Config) (*Server, error) {
 		meta.Close()
 		return nil, err
 	}
+	// Wire each set's id allocator through bbolt so a post-crash restart
+	// can't reissue an id whose .seg file was unlinked but whose detaching
+	// tx rolled back. Must precede any newActive/RotateIfFull call.
+	if err := hotSegs.AttachMeta(meta); err != nil {
+		meta.Close()
+		return nil, fmt.Errorf("attach meta to hot segs: %w", err)
+	}
+	if err := coldSegs.AttachMeta(meta); err != nil {
+		meta.Close()
+		return nil, fmt.Errorf("attach meta to cold segs: %w", err)
+	}
 
 	if cfg.RebuildMeta {
 		log.Printf("place: rebuilding metadata from cold segments...")
