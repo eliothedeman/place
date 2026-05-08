@@ -517,6 +517,12 @@ func (c *Compactor) SetPreSwapHookForTest(hook func(id uint64)) {
 //   - drops every fully-dead (Live==0) segment outright
 //   - forward-compacts up to gcMaxFwdPerPass partially-dead ones whose
 //     dead ratio exceeds gcDeadRatio, deadest first
+//
+// Skips the currently-active segment in both phases. The activeID is
+// resampled inside the deletion tx (and again inside forwardCompact's
+// teardown tx) so that a writer rotation mid-pass can't promote the
+// formerly-active seg into a delete candidate behind our backs — see
+// the inline comment on the second sample for the failure mode.
 func (c *Compactor) gcPass(tier Tier) {
 	segs, err := c.meta.ListSegments(tier)
 	if err != nil {
@@ -577,7 +583,23 @@ func (c *Compactor) gcPass(tier Tier) {
 			return
 		}
 		if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
+			// Re-sample activeID inside the tx as a final guard against a
+			// writer rotation that landed between the pre-loop snapshot
+			// and now. The pre-loop activeID filters most candidates, but
+			// if RotateIfFull fires mid-pass the ex-active segment ends
+			// up in deadIDs (its Live==0 if no fragments were committed
+			// to it) and we'd unlink the file out from under any fragment
+			// the rotating writer is about to commit. Skipping the new
+			// active here keeps deletion strictly "not the active right
+			// now", which is the only invariant Remove needs.
+			currentActiveID := uint32(0)
+			if a, _ := set.Active(); a != nil {
+				currentActiveID = a.id
+			}
 			for _, id := range deadIDs {
+				if id == currentActiveID {
+					continue
+				}
 				if err := DeleteSegmentTx(tx, tier, id); err != nil {
 					return err
 				}
@@ -591,7 +613,17 @@ func (c *Compactor) gcPass(tier Tier) {
 			log.Printf("place: gc post-delete flush: %v", err)
 			return
 		}
+		// Re-sample once more before unlinking files — same race window,
+		// same guard: only unlink ids whose SegmentMeta we actually just
+		// deleted, which by construction excludes the current active.
+		currentActiveID := uint32(0)
+		if a, _ := set.Active(); a != nil {
+			currentActiveID = a.id
+		}
 		for _, id := range deadIDs {
+			if id == currentActiveID {
+				continue
+			}
 			if err := set.Remove(id); err != nil {
 				log.Printf("place: gc remove %d: %v", id, err)
 				// Continue — meta is already detached, so a residual
@@ -631,6 +663,12 @@ func (c *Compactor) gcPass(tier Tier) {
 // each live fragment's bytes into the active segment of the same tier, and
 // updates the FileMeta to point at the new location. Old segment is then
 // deleted.
+//
+// gcPass already filtered target against a pre-loop activeID snapshot, but
+// the writer can rotate between then and now. If the rotation promoted
+// target into the active slot, deleting it would unlink the file the next
+// Append is about to write into. Re-sample inside the teardown tx (and
+// before set.Remove) to catch that window.
 func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	c.dbg.log("gc: forward-compact segment %d tier=%d (live=%s total=%s)",
 		target.ID, tier, humanBytes(target.Live), humanBytes(target.Total))
@@ -642,6 +680,14 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	oldSeg := set.Get(target.ID)
 	if oldSeg == nil {
 		log.Printf("place: gc: segment %d missing on disk", target.ID)
+		return
+	}
+	// Bail before doing any work if target is now the active segment —
+	// rewriteRefs below would have to read from and write to the same
+	// segment, and even if that worked we'd unlink it at the end. Cheap
+	// check; a follow-up gc tick will retry once the writer rotates.
+	if a, _ := set.Active(); a != nil && a.id == target.ID {
+		c.dbg.log("gc: skip forward-compact %d tier=%d (now active)", target.ID, tier)
 		return
 	}
 
@@ -691,6 +737,15 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 		return
 	}
 	if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
+		// Final guard against a writer rotation that promoted target into
+		// the active slot during rewriteRefs. Bail rather than delete —
+		// the relocated bytes are already written to (the new) active and
+		// referenced from FileMetas, so all that's lost by skipping is
+		// the source-segment teardown; the next gc tick retries.
+		if a, _ := set.Active(); a != nil && a.id == target.ID {
+			c.dbg.log("gc: skip teardown %d tier=%d (now active)", target.ID, tier)
+			return nil
+		}
 		return DeleteSegmentTx(tx, tier, target.ID)
 	}); err != nil {
 		log.Printf("place: gc delete meta %d: %v", target.ID, err)
@@ -698,6 +753,13 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	}
 	if err := c.meta.Flush(); err != nil {
 		log.Printf("place: gc post-delete flush %d: %v", target.ID, err)
+		return
+	}
+	// Same guard before unlinking the file. The Active() and Remove()
+	// pair isn't atomic — a rotation racing with us here would still
+	// have ended up in the activeID slot above, and we'd skip; if not,
+	// it's safe to unlink because the rotation hasn't picked target.
+	if a, _ := set.Active(); a != nil && a.id == target.ID {
 		return
 	}
 	if err := set.Remove(target.ID); err != nil {
