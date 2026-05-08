@@ -266,10 +266,9 @@ type segKey struct {
 type Meta struct {
 	db *bolt.DB
 
-	mu      sync.Mutex
-	files   map[string]*FileMeta   // overlay entries; pointer-shared with callers (under mu)
-	deleted map[string]bool        // tombstones (overlay-level deletes)
-	segs    map[segKey]*SegmentMeta // segment-meta overlay
+	mu    sync.Mutex
+	files map[string]*FileMeta    // overlay entries; pointer-shared with callers (under mu)
+	segs  map[segKey]*SegmentMeta // segment-meta overlay
 }
 
 func NewMeta(path string) (*Meta, error) {
@@ -327,10 +326,9 @@ func NewMeta(path string) (*Meta, error) {
 		return nil, err
 	}
 	return &Meta{
-		db:      db,
-		files:   make(map[string]*FileMeta),
-		deleted: make(map[string]bool),
-		segs:    make(map[segKey]*SegmentMeta),
+		db:    db,
+		files: make(map[string]*FileMeta),
+		segs:  make(map[segKey]*SegmentMeta),
 	}, nil
 }
 
@@ -347,16 +345,13 @@ func (m *Meta) DB() *bolt.DB { return m.db }
 
 // --- overlay plumbing ---
 
-// getFileLocked returns the in-memory FileMeta for rel, loading from bbolt on
-// miss and caching the loaded copy in the overlay for subsequent mutations.
-// Returns (nil, nil) for tombstoned or missing files.
+// getFileLocked returns the in-memory FileMeta for rel, loading from bbolt
+// on miss and caching the loaded copy in the overlay for subsequent
+// mutations. Returns (nil, nil) for missing files.
 //
 // The returned *FileMeta is the overlay's own copy; callers that mutate it
 // (under m.mu) thereby stage the mutation for the next flush.
 func (m *Meta) getFileLocked(rel string) (*FileMeta, error) {
-	if m.deleted[rel] {
-		return nil, nil
-	}
 	if fm, ok := m.files[rel]; ok {
 		return fm, nil
 	}
@@ -374,19 +369,6 @@ func (m *Meta) getFileLocked(rel string) (*FileMeta, error) {
 	}
 	m.files[rel] = out
 	return out, nil
-}
-
-// putFileLocked stores fm in the overlay (pointer-shared). Must be called
-// with m.mu held.
-func (m *Meta) putFileLocked(fm *FileMeta) {
-	m.files[fm.Rel] = fm
-	delete(m.deleted, fm.Rel)
-}
-
-// deleteFileLocked marks rel as tombstoned in the overlay.
-func (m *Meta) deleteFileLocked(rel string) {
-	delete(m.files, rel)
-	m.deleted[rel] = true
 }
 
 // getSegLocked returns the in-memory SegmentMeta, loading from bbolt on miss.
@@ -419,15 +401,10 @@ func (m *Meta) putSegLocked(sm *SegmentMeta) {
 // flushOverlayLocked commits the overlay to bbolt (no db.Sync). Clears the
 // overlay on success.
 func (m *Meta) flushOverlayLocked() error {
-	if len(m.files) == 0 && len(m.deleted) == 0 && len(m.segs) == 0 {
+	if len(m.files) == 0 && len(m.segs) == 0 {
 		return nil
 	}
 	err := m.db.Update(func(tx *bolt.Tx) error {
-		for rel := range m.deleted {
-			if err := DeleteFileTx(tx, rel); err != nil {
-				return err
-			}
-		}
 		for _, fm := range m.files {
 			if err := PutFileTx(tx, fm); err != nil {
 				return err
@@ -445,13 +422,12 @@ func (m *Meta) flushOverlayLocked() error {
 	}
 	// Reset overlay.
 	m.files = make(map[string]*FileMeta)
-	m.deleted = make(map[string]bool)
 	m.segs = make(map[segKey]*SegmentMeta)
 	return nil
 }
 
 // WithOverlay runs fn under m.mu so fn can safely call getFileLocked /
-// putFileLocked / etc. Used by the writer path.
+// getSegLocked / etc. Used by the writer path.
 func (m *Meta) WithOverlay(fn func() error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
