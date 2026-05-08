@@ -16,6 +16,11 @@ import (
 //     tx never committed).
 //   - If bbolt has no SegmentMeta, register one based on the file's size.
 //     This covers a crash that left an empty freshly-created segment.
+//   - If the file is shorter than SegmentMeta.Total, drop fragments past
+//     seg.Size() from every referencing FileMeta and update Total down
+//     to seg.Size(). The lost bytes are unreadable either way; surfacing
+//     them as zero-fill (per Reader's pre-zero behavior) beats permanent
+//     EIO on reads of the affected range.
 func reconcile(meta *Meta, set *SegmentSet) error {
 	for _, id := range set.All() {
 		seg := set.Get(id)
@@ -68,12 +73,147 @@ func reconcile(meta *Meta, set *SegmentSet) error {
 			}
 		}
 		if seg.Size() < expectTotal {
-			// File is shorter than bbolt claims — serious inconsistency.
-			log.Printf("place: WARNING segment %d (tier=%d) shorter than meta (%d < %d)",
-				id, set.tier, seg.Size(), expectTotal)
+			// File is shorter than bbolt claims — fsync ordering normally
+			// prevents this, but it can surface after a manual truncate, a
+			// half-failed sync, or a hardware fault. Drop fragments past
+			// seg.Size() from every referencing FileMeta and lower Total
+			// to match the file. Reads of the affected byte ranges then
+			// fall through to Reader's pre-zero-fill instead of EIO.
+			if err := quarantineShortSegment(meta, set, id, seg); err != nil {
+				return fmt.Errorf("quarantine %d: %w", id, err)
+			}
 		}
 	}
 	return nil
+}
+
+// quarantineShortSegment is reconcile's repair path for a segment whose
+// file is shorter than its bbolt SegmentMeta.Total. It walks every FileMeta
+// that references the segment, drops (or partially truncates) fragments
+// whose extent exceeds seg.Size(), debits the dropped bytes from the
+// segment's Live counter, and lowers Total to seg.Size() so subsequent
+// reconciles don't re-trigger.
+//
+// fm.Size is intentionally not adjusted: the file's logical end may still
+// be valid via cold/other-segment fragments, and even if it isn't, the
+// Reader's pre-zero behavior turns reads past coverage into zero-fill —
+// strictly better than the EIO that the caller would otherwise see.
+//
+// For partial truncation (a fragment straddling seg.Size()), the readable
+// prefix is retained via fragment.go's truncateFragments helper.
+func quarantineShortSegment(meta *Meta, set *SegmentSet, segID uint32, seg *Segment) error {
+	segSize := seg.Size()
+	var (
+		droppedFiles int
+		droppedBytes int64
+	)
+	err := meta.UpdateLocked(func(tx *bolt.Tx) error {
+		// Collect inode IDs first; we mutate inodes as we go and don't
+		// want to invalidate the cursor mid-walk.
+		var refs []uint64
+		if err := iterateInodesTx(tx, func(id uint64, fm *FileMeta) error {
+			if referencesSegment(fm, set.tier, segID) {
+				refs = append(refs, id)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, id := range refs {
+			fm, err := getInodeTx(tx, id)
+			if err != nil {
+				return err
+			}
+			if fm == nil {
+				continue
+			}
+			changed, deadBytes := dropUnreadableFragments(fm, segID, set.tier, segSize)
+			if !changed {
+				continue
+			}
+			fm.Version++
+			if err := putInodeTx(tx, id, fm); err != nil {
+				return err
+			}
+			droppedFiles++
+			droppedBytes += deadBytes
+		}
+		// Adjust SegmentMeta: Total down to seg.Size(), Live debited by
+		// the bytes we just dropped (clamped at 0 by the segment-meta
+		// arithmetic — a corrupt Live underflow would be visible as a
+		// negative pre-clamp value, but we don't flag it specially here).
+		sm, err := GetSegmentTx(tx, set.tier, segID)
+		if err != nil {
+			return err
+		}
+		if sm == nil {
+			// No meta to update; nothing else to do.
+			return nil
+		}
+		sm.Total = segSize
+		sm.Live -= droppedBytes
+		if sm.Live < 0 {
+			sm.Live = 0
+		}
+		return PutSegmentTx(tx, sm)
+	})
+	if err != nil {
+		return err
+	}
+	log.Printf("place: reconcile %d (tier=%d) shorter than meta — "+
+		"dropped %d unreadable fragment bytes across %d files, lowered Total to %d",
+		segID, set.tier, droppedBytes, droppedFiles, segSize)
+	return nil
+}
+
+// dropUnreadableFragments removes (or partially truncates) fragments in
+// fm.HotFragments / fm.ColdFragments that point at segID with a SegmentOffset
+// extent past segSize. Returns whether any change was made and the number of
+// payload bytes dropped (so the caller can debit segment.Live).
+//
+// A fragment is "unreadable" when SegmentOffset+Length > segSize. The prefix
+// [SegmentOffset, segSize) is still on disk, so we keep the corresponding
+// logical-byte prefix as a shorter fragment and drop only the past-EOF tail.
+// Fragments wholly past segSize are dropped entirely.
+func dropUnreadableFragments(fm *FileMeta, segID uint32, tier Tier, segSize int64) (bool, int64) {
+	walk := func(list []Fragment) (out []Fragment, dropped int64, changed bool) {
+		for _, f := range list {
+			if f.Tier != tier || f.SegmentID != segID {
+				out = append(out, f)
+				continue
+			}
+			fragEnd := f.SegmentOffset + f.Length
+			if fragEnd <= segSize {
+				out = append(out, f)
+				continue
+			}
+			changed = true
+			if f.SegmentOffset >= segSize {
+				// Fully past EOF — drop the whole fragment.
+				dropped += f.Length
+				continue
+			}
+			// Straddles the boundary: keep the readable prefix.
+			keepLen := segSize - f.SegmentOffset
+			out = append(out, Fragment{
+				LogicalOffset: f.LogicalOffset,
+				Length:        keepLen,
+				Tier:          f.Tier,
+				SegmentID:     f.SegmentID,
+				SegmentOffset: f.SegmentOffset,
+			})
+			dropped += f.Length - keepLen
+		}
+		return out, dropped, changed
+	}
+	hot, hotDead, hotChanged := walk(fm.HotFragments)
+	cold, coldDead, coldChanged := walk(fm.ColdFragments)
+	if !hotChanged && !coldChanged {
+		return false, 0
+	}
+	fm.HotFragments = hot
+	fm.ColdFragments = cold
+	return true, hotDead + coldDead
 }
 
 // rebuildMetaFromCold walks cold segment records and reconstructs the files
@@ -223,4 +363,10 @@ func rebuildMetaFromCold(meta *Meta, coldSegs *SegmentSet) error {
 // recovery path end-to-end without standing up a full Mount.
 func RebuildMetaFromColdForTest(meta *Meta, coldSegs *SegmentSet) error {
 	return rebuildMetaFromCold(meta, coldSegs)
+}
+
+// ReconcileForTest is a test-only entry point that runs the production
+// reconcile logic. Mirrors mount.go's startup ordering for one tier.
+func ReconcileForTest(meta *Meta, set *SegmentSet) error {
+	return reconcile(meta, set)
 }
