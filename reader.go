@@ -37,6 +37,13 @@ func NewReader(hot, cold *SegmentSet, meta *Meta) *Reader {
 // filled (may be < len(dst) at EOF). Missing ranges within [0, Size) are
 // zero-filled.
 //
+// Implements the io.ReaderAt contract: returns (n, io.EOF) whenever n <
+// len(dst) on a successful read — i.e. when the requested range extends past
+// fm.Size. External callers wrapping Reader as io.ReaderAt rely on the EOF
+// signal to stop reading; without it, a short read past EOF would silently
+// look like a successful zero-fill and the caller would loop forever or
+// truncate at the wrong place.
+//
 // On a worker error, returns (n, err) where n is the byte length of the
 // contiguous prefix not affected by any failed slice — POSIX read(2) permits
 // short returns and the FUSE layer surfaces the survivor bytes to the caller.
@@ -76,6 +83,11 @@ func (r *Reader) ReadAt(rel string, dst []byte, off int64) (int, error) {
 	maxN, execErr := r.execute(all, dst, readLen)
 	if execErr != nil {
 		return int(maxN), execErr
+	}
+	// Short read at EOF: io.ReaderAt requires a non-nil error whenever
+	// n < len(dst). readLen < len(dst) iff the request extended past fm.Size.
+	if readLen < int64(len(dst)) {
+		return int(readLen), io.EOF
 	}
 	return int(readLen), nil
 }

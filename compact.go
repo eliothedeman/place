@@ -3,6 +3,7 @@ package place
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"sort"
 	"sync"
@@ -254,7 +255,16 @@ func (c *Compactor) replicateOne(id uint64) error {
 			n = remaining
 		}
 		chunk := buf[:n]
-		if _, err := c.reader.ReadAt(rel, chunk, off); err != nil {
+		nRead, err := c.reader.ReadAt(rel, chunk, off)
+		// io.EOF here means fm.Size shrunk between the size capture above
+		// and the read (eviction/truncate). Frame only the bytes we got
+		// and break the loop — there are no more bytes to read.
+		shrunk := false
+		if err == io.EOF {
+			shrunk = true
+			err = nil
+		}
+		if err != nil {
 			// Eviction (which only fires for files that already have a
 			// full cold copy) wipes HotFragments and can leave GC to
 			// remove the now-dead hot segments. If our read failed and
@@ -272,8 +282,14 @@ func (c *Compactor) replicateOne(id uint64) error {
 			done(fs_errno(err))
 			return fmt.Errorf("read %q @%d: %w", rel, off, err)
 		}
+		chunk = chunk[:nRead]
 
-		recLen := int64(headerFixedSize + len(rel) + int(n) + trailerSize)
+		// Empty chunk (file shrunk to exactly off) — nothing to write.
+		if nRead == 0 {
+			break
+		}
+
+		recLen := int64(headerFixedSize + len(rel) + nRead + trailerSize)
 		if _, _, err := c.coldSegs.RotateIfFull(recLen); err != nil {
 			done(fs_errno(err))
 			return err
@@ -289,10 +305,15 @@ func (c *Compactor) replicateOne(id uint64) error {
 			return err
 		}
 		records = append(records, coldRecord{
-			logOff: off, length: n, segID: seg.id, segOff: segOff, recLen: recLen,
+			logOff: off, length: int64(nRead), segID: seg.id, segOff: segOff, recLen: recLen,
 		})
 		touchedSegs[seg.id] = seg
-		off += n
+		off += int64(nRead)
+
+		if shrunk {
+			// fm.Size shrunk past our captured size; no more bytes to read.
+			break
+		}
 
 		if size >= replicateProgressEvery*2 && off >= nextProgress {
 			c.dbg.log("replicate: %s %s/%s (%.0f%%)",
