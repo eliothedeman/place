@@ -267,7 +267,7 @@ type Meta struct {
 	db *bolt.DB
 
 	mu    sync.Mutex
-	files map[string]*FileMeta    // overlay entries; pointer-shared with callers (under mu)
+	files map[uint64]*FileMeta    // overlay entries keyed by inodeID; pointer-shared with callers (under mu)
 	segs  map[segKey]*SegmentMeta // segment-meta overlay
 }
 
@@ -327,7 +327,7 @@ func NewMeta(path string) (*Meta, error) {
 	}
 	return &Meta{
 		db:    db,
-		files: make(map[string]*FileMeta),
+		files: make(map[uint64]*FileMeta),
 		segs:  make(map[segKey]*SegmentMeta),
 	}, nil
 }
@@ -346,28 +346,42 @@ func (m *Meta) DB() *bolt.DB { return m.db }
 // --- overlay plumbing ---
 
 // getFileLocked returns the in-memory FileMeta for rel, loading from bbolt
-// on miss and caching the loaded copy in the overlay for subsequent
-// mutations. Returns (nil, nil) for missing files.
+// on miss and caching the loaded copy in the overlay (keyed by inodeID)
+// for subsequent mutations. Returns (nil, nil) for missing files.
 //
-// The returned *FileMeta is the overlay's own copy; callers that mutate it
-// (under m.mu) thereby stage the mutation for the next flush.
+// Keying by inodeID is required for hardlink correctness: two paths to
+// one inode MUST share a single FileMeta in the overlay so concurrent
+// writes through different rels accumulate into the same fragment list.
+// Pre-fix the overlay was rel-keyed, so two paths produced two FileMeta
+// copies that both wrote back to the same inodes-bucket key — and
+// last-flush-wins silently dropped one writer's fragments.
+//
+// The returned *FileMeta is the overlay's own copy; callers that mutate
+// it (under m.mu) thereby stage the mutation for the next flush.
 func (m *Meta) getFileLocked(rel string) (*FileMeta, error) {
-	if fm, ok := m.files[rel]; ok {
-		return fm, nil
-	}
-	var out *FileMeta
+	var (
+		id  uint64
+		out *FileMeta
+	)
 	err := m.db.View(func(tx *bolt.Tx) error {
-		fm, err := GetFileTx(tx, rel)
-		if err != nil {
+		var err error
+		id, err = inodeForPathTx(tx, rel)
+		if err != nil || id == 0 {
 			return err
 		}
-		out = fm
-		return nil
+		if fm, ok := m.files[id]; ok {
+			out = fm
+			return nil
+		}
+		out, err = getInodeTx(tx, id)
+		return err
 	})
 	if err != nil || out == nil {
 		return out, err
 	}
-	m.files[rel] = out
+	if _, cached := m.files[id]; !cached {
+		m.files[id] = out
+	}
 	return out, nil
 }
 
@@ -400,13 +414,19 @@ func (m *Meta) putSegLocked(sm *SegmentMeta) {
 
 // flushOverlayLocked commits the overlay to bbolt (no db.Sync). Clears the
 // overlay on success.
+//
+// Files are persisted via putInodeTx keyed by the overlay's inodeID, NOT
+// via PutFileTx (which routes through paths[fm.Rel]). With a per-inode
+// overlay, fm.Rel is the inode's stored primary name and may not match
+// the rel a writer used to reach it; addressing the inode directly is
+// the only correct way to flush.
 func (m *Meta) flushOverlayLocked() error {
 	if len(m.files) == 0 && len(m.segs) == 0 {
 		return nil
 	}
 	err := m.db.Update(func(tx *bolt.Tx) error {
-		for _, fm := range m.files {
-			if err := PutFileTx(tx, fm); err != nil {
+		for id, fm := range m.files {
+			if err := putInodeTx(tx, id, fm); err != nil {
 				return err
 			}
 		}
@@ -421,7 +441,7 @@ func (m *Meta) flushOverlayLocked() error {
 		return err
 	}
 	// Reset overlay.
-	m.files = make(map[string]*FileMeta)
+	m.files = make(map[uint64]*FileMeta)
 	m.segs = make(map[segKey]*SegmentMeta)
 	return nil
 }
