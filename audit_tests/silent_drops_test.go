@@ -308,20 +308,17 @@ func TestRebuildPreservesLiveAcrossOverwrites(t *testing.T) {
 	}
 }
 
-// TestReaderDiscardsPartialReadOnError exercises reader.go:178-183. When a
-// read spans multiple segments and one fails, the parallel execute returns
-// the first worker's error and ReadAt returns (0, err). Bytes that other
-// workers successfully wrote into dst are discarded — and file.go:65 uses
-// `dest[:n]` where n is forced to 0 on error, so the kernel sees an EIO
-// with no bytes and the application discards everything.
+// TestReaderReturnsSurvivorBytesOnPartialReadError pins the post-fix
+// behaviour for reader.go's parallel execute. When a read spans multiple
+// segments and one fails, ReadAt now returns (maxN, err) where maxN is the
+// DstOffset of the earliest-failing slice — i.e. the byte length of the
+// contiguous prefix that no failed slice intersected. POSIX read(2) permits
+// short returns; the FUSE layer surfaces those bytes as a successful short
+// read so a subsequent read at off+maxN retries the bad range.
 //
-// The "right" behaviour for POSIX read is "return whatever was read up to
-// the first hole/error" (short read with partial data). The current
-// behaviour means a single bad fragment in a 16 MB read kills the whole
-// buffer.
-//
-// Severity: latent — magnifies a small fault into a much larger one.
-func TestReaderDiscardsPartialReadOnError(t *testing.T) {
+// Pre-fix: ReadAt returned (0, err) and file.Read truncated dest[:0],
+// magnifying a single-fragment fault into a whole-buffer EIO.
+func TestReaderReturnsSurvivorBytesOnPartialReadError(t *testing.T) {
 	hot, cold := dirs(t)
 	meta := openMeta(t, hot)
 	defer meta.Close()
@@ -343,10 +340,7 @@ func TestReaderDiscardsPartialReadOnError(t *testing.T) {
 	}
 
 	// Two writes; the small max segment forces them into different segs.
-	// Each record carries headerFixedSize(19) + len(rel) + payload + trailer(4)
-	// of framing. With maxSize=64, an 8-byte payload (32-byte record) plus a
-	// second 8-byte payload fits in one seg. We need the FIRST write to
-	// nearly fill the seg, then the second triggers rotation.
+	// First write nearly fills the seg, second triggers rotation.
 	if err := w.Submit("f", 0, bytes.Repeat([]byte("A"), 30)); err != nil {
 		t.Fatal(err)
 	}
@@ -364,8 +358,8 @@ func TestReaderDiscardsPartialReadOnError(t *testing.T) {
 	if fm.HotFragments[0].SegmentID == fm.HotFragments[1].SegmentID {
 		t.Fatalf("setup: expected different segs, got both in seg %d", fm.HotFragments[0].SegmentID)
 	}
-	survivor := fm.HotFragments[0].SegmentID
 	doomed := fm.HotFragments[1].SegmentID
+	doomedDstOff := fm.HotFragments[1].LogicalOffset // read starts at off=0
 
 	// Take down the second fragment's segment to force a read failure on
 	// it while the first fragment remains readable.
@@ -380,25 +374,82 @@ func TestReaderDiscardsPartialReadOnError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if n != 0 {
-		t.Logf("returned partial bytes — bug may be partly fixed (n=%d)", n)
-		return
+	// maxN must be at least the survivor fragment's end (no failed slice
+	// intersects [0, doomedDstOff)). The exact value is the DstOffset of
+	// the earliest-failing slice — for this layout, that's the doomed
+	// fragment's LogicalOffset.
+	if int64(n) != doomedDstOff {
+		t.Errorf("expected n=%d (doomed fragment's DstOffset), got %d", doomedDstOff, n)
 	}
-	// Inspect dst for the survivor's bytes — they were written, then
-	// discarded by the (n=0, err) return convention.
+	// Survivor bytes must be present in dst[:n].
 	survivorRange := dst[fm.HotFragments[0].LogicalOffset : fm.HotFragments[0].LogicalOffset+fm.HotFragments[0].Length]
-	if bytes.Equal(survivorRange, bytes.Repeat([]byte("A"), 30)) {
-		t.Logf("BUG CONFIRMED: survivor seg %d's bytes WERE written into dst, "+
-			"but ReadAt returned n=0 so file.Read truncates to dest[:0]. "+
-			"The kernel/app sees EIO with zero bytes — single-fragment failure poisons whole read. "+
-			"survivor bytes in dst=%q",
-			survivor, survivorRange)
-	} else {
-		// Workers may not have completed before the error short-circuited.
-		// Either way the API surface drops everything.
-		t.Logf("survivor bytes not in dst (worker scheduled after error short-circuit). "+
-			"Either way: caller has no way to receive partial data. survivor=%v doomed=%v",
-			survivor, doomed)
+	if !bytes.Equal(survivorRange, bytes.Repeat([]byte("A"), 30)) {
+		t.Errorf("survivor bytes missing from dst: got %q", survivorRange)
+	}
+}
+
+// TestReaderReturnsZeroWhenFirstSliceFails pins the no-survivor edge case.
+// When the earliest-failing slice is at DstOffset 0, there's no contiguous
+// survivor prefix and ReadAt must return (0, err) so the caller sees a real
+// EIO — not a phantom successful short read of zero bytes.
+func TestReaderReturnsZeroWhenFirstSliceFails(t *testing.T) {
+	hot, cold := dirs(t)
+	meta := openMeta(t, hot)
+	defer meta.Close()
+	hotSegs := newHot(t, hot, 64)
+	defer hotSegs.CloseAll()
+	coldSegs := newCold(t, cold, 1<<30)
+	defer coldSegs.CloseAll()
+
+	w := place.NewWriter(hotSegs, meta, nil)
+	defer w.Close()
+
+	now := time.Now().UnixNano()
+	if err := meta.PutFile(&place.FileMeta{
+		Rel: "f", Mode: syscall.S_IFREG | 0o644,
+		Mtime: now, Ctime: now, Atime: now, Nlink: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two writes that rotate into separate segs (same setup as the
+	// survivor test). We then kill the FIRST fragment's segment so the
+	// earliest-failing DstOffset is 0.
+	if err := w.Submit("f", 0, bytes.Repeat([]byte("A"), 30)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Submit("f", 100, bytes.Repeat([]byte("B"), 30)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	fm := readFile(t, meta, "f")
+	if len(fm.HotFragments) != 2 {
+		t.Fatalf("setup: expected 2 fragments, got %v", fm.HotFragments)
+	}
+	if fm.HotFragments[0].SegmentID == fm.HotFragments[1].SegmentID {
+		t.Fatalf("setup: expected different segs, got both in seg %d", fm.HotFragments[0].SegmentID)
+	}
+	if fm.HotFragments[0].LogicalOffset != 0 {
+		t.Fatalf("setup: expected first fragment at offset 0, got %d", fm.HotFragments[0].LogicalOffset)
+	}
+	doomed := fm.HotFragments[0].SegmentID
+
+	if err := hotSegs.Remove(doomed); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := place.NewReader(hotSegs, coldSegs, meta)
+	dst := make([]byte, 200)
+	n, err := reader.ReadAt("f", dst, 0)
+	t.Logf("read after killing seg %d (covering offset 0): n=%d err=%v", doomed, n, err)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if n != 0 {
+		t.Errorf("expected n=0 (no survivor prefix), got %d", n)
 	}
 }
 

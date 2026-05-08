@@ -54,6 +54,16 @@ func (f *placeFile) Read(ctx context.Context, dest []byte, off int64) (fuse.Read
 	done := f.root.dbg.op("Read", f.rel, "off=%d len=%d", off, len(dest))
 	n, err := f.root.reader.ReadAt(f.rel, dest, off)
 	if err != nil && err != io.EOF {
+		// On partial reads (one slice errored, others succeeded) Reader
+		// returns (n>0, err). POSIX read(2) permits short returns, so
+		// surface the survivor prefix as success — a subsequent read at
+		// off+n will retry the failed range and either succeed or surface
+		// EIO with n=0. Returning an errno alongside non-zero data would
+		// be lost by the kernel anyway.
+		if n > 0 {
+			done(0, "bytes=%d partial err=%v", n, err)
+			return fuse.ReadResultData(dest[:n]), 0
+		}
 		if errno, ok := err.(syscall.Errno); ok {
 			done(errno)
 			return nil, errno

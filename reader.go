@@ -36,6 +36,11 @@ func NewReader(hot, cold *SegmentSet, meta *Meta) *Reader {
 // ReadAt fills dst from rel starting at `off`. Returns the number of bytes
 // filled (may be < len(dst) at EOF). Missing ranges within [0, Size) are
 // zero-filled.
+//
+// On a worker error, returns (n, err) where n is the byte length of the
+// contiguous prefix not affected by any failed slice — POSIX read(2) permits
+// short returns and the FUSE layer surfaces the survivor bytes to the caller.
+// If the very first slice failed (no survivor prefix), returns (0, err).
 func (r *Reader) ReadAt(rel string, dst []byte, off int64) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
@@ -68,8 +73,9 @@ func (r *Reader) ReadAt(rel string, dst []byte, off int64) (int, error) {
 	gaps := uncoveredRanges(hotSlices, 0, readLen)
 	coldSlices := planColdForGaps(fm.ColdFragments, gaps, off)
 	all := append(hotSlices, coldSlices...)
-	if err := r.execute(all, dst); err != nil {
-		return 0, err
+	maxN, execErr := r.execute(all, dst, readLen)
+	if execErr != nil {
+		return int(maxN), execErr
 	}
 	return int(readLen), nil
 }
@@ -137,20 +143,37 @@ func uncoveredRanges(slices []readSlice, base, end int64) []span {
 	return out
 }
 
-func (r *Reader) execute(slices []readSlice, dst []byte) error {
+// execute runs the planned scatter-gather reads. Returns (maxN, err) where
+// maxN is the byte length of the contiguous prefix of dst that no failed
+// slice intersected — i.e. the DstOffset of the earliest-failing slice, or
+// readLen if every slice succeeded. Holes (no slice) are implicit zero-fill
+// from ReadAt's pre-clear, so they don't break contiguity. err is nil if
+// every slice succeeded.
+//
+// readSlice's strict length check means a partial pread returns an error
+// (no partial fill of the slice's dst window), so an errored slice's
+// DstOffset is a safe upper bound for "bytes the caller can trust".
+func (r *Reader) execute(slices []readSlice, dst []byte, readLen int64) (int64, error) {
 	if len(slices) == 0 {
-		return nil
+		return readLen, nil
 	}
 	if len(slices) == 1 {
-		return r.readSlice(slices[0], dst)
+		if err := r.readSlice(slices[0], dst); err != nil {
+			return slices[0].DstOffset, err
+		}
+		return readLen, nil
 	}
 	// Bounded parallel execution.
 	workers := r.parallel
 	if workers > len(slices) {
 		workers = len(slices)
 	}
+	type sliceErr struct {
+		dstOff int64
+		err    error
+	}
 	jobs := make(chan readSlice)
-	errCh := make(chan error, workers)
+	errCh := make(chan sliceErr, len(slices))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -158,14 +181,11 @@ func (r *Reader) execute(slices []readSlice, dst []byte) error {
 			defer wg.Done()
 			for s := range jobs {
 				if err := r.readSlice(s, dst); err != nil {
-					// Surface the first error per worker, but keep
-					// draining `jobs` so the sender can't deadlock if
-					// every worker errors on its first slice (e.g.
-					// segments removed by GC mid-replicate).
-					select {
-					case errCh <- err:
-					default:
-					}
+					// Record (dstOffset, err) for every failure — caller
+					// picks the earliest dstOffset to compute the survivor
+					// prefix. Buffer is sized to len(slices) so we never
+					// drop and never block.
+					errCh <- sliceErr{dstOff: s.DstOffset, err: err}
 				}
 			}
 		}()
@@ -175,12 +195,19 @@ func (r *Reader) execute(slices []readSlice, dst []byte) error {
 	}
 	close(jobs)
 	wg.Wait()
-	select {
-	case err := <-errCh:
-		return err
-	default:
-		return nil
+	close(errCh)
+	firstErrAt := readLen
+	var firstErr error
+	for se := range errCh {
+		if se.dstOff < firstErrAt {
+			firstErrAt = se.dstOff
+			firstErr = se.err
+		}
 	}
+	if firstErr != nil {
+		return firstErrAt, firstErr
+	}
+	return readLen, nil
 }
 
 func (r *Reader) readSlice(s readSlice, dst []byte) error {
