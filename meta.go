@@ -631,6 +631,54 @@ func putInodeTx(tx *bolt.Tx, id uint64, fm *FileMeta) error {
 	return tx.Bucket(bucketInodes).Put(inodeKey(id), enc)
 }
 
+// findPathForInodeTx returns any rel that maps to id, or "" if no path
+// resolves to it. O(N) scan of the paths bucket — used by DeleteFileTx
+// and the startup repair pass to repoint a stale fm.Rel at a surviving
+// hardlink. Returns the first key found in cursor order; callers don't
+// need a specific name, only one that round-trips through the paths
+// bucket back to this inode.
+func findPathForInodeTx(tx *bolt.Tx, id uint64) (string, error) {
+	pb := tx.Bucket(bucketPaths)
+	if pb == nil {
+		return "", nil
+	}
+	c := pb.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if len(v) != 8 {
+			continue
+		}
+		if binary.LittleEndian.Uint64(v) == id {
+			return keyToRel(k), nil
+		}
+	}
+	return "", nil
+}
+
+// iterateInodesTx walks every (inodeID, FileMeta) pair in bucketInodes.
+// Compaction and eviction use this so they can operate on inode identity
+// directly — fm.Rel can become stale across hardlink unlink and rename, so
+// re-resolving via paths[fm.Rel] is unsafe. fn returning a non-nil error
+// stops the walk and propagates the error.
+func iterateInodesTx(tx *bolt.Tx, fn func(id uint64, fm *FileMeta) error) error {
+	ib := tx.Bucket(bucketInodes)
+	if ib == nil {
+		return nil
+	}
+	c := ib.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		fm, err := decodeFileMeta(v)
+		if err != nil {
+			return err
+		}
+		id := keyToInode(k)
+		fm.InodeID = id
+		if err := fn(id, fm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // movePathTx renames paths[oldRel] → paths[newRel], preserving the inodeID.
 // If the inode's fm.Rel is currently oldRel, it's updated to newRel (so
 // cold-record framing uses the up-to-date primary name). Returns ENOENT if
