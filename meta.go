@@ -787,6 +787,13 @@ func PutFileTx(tx *bolt.Tx, fm *FileMeta) error {
 // responsible for AddLiveBytesTx — historically callers do this *before*
 // DeleteFileTx, so the contract here is unchanged: Nlink-aware unlink is a
 // follow-up task; for V1 every inode has Nlink=1 and unlink fully removes).
+//
+// Invariant: while Nlink>0, fm.Rel must name a path that resolves back to
+// the inode. Compaction streams record framing through fm.Rel and looks
+// the inode up via paths[fm.Rel] — a stale Rel reads as "file gone" and
+// silently skips the inode, causing forwardCompact to drop the source
+// segment without relocating its fragments. When the deleted path
+// matches fm.Rel, repoint Rel at any surviving hardlink before persisting.
 func DeleteFileTx(tx *bolt.Tx, rel string) error {
 	id, err := inodeForPathTx(tx, rel)
 	if err != nil {
@@ -811,6 +818,22 @@ func DeleteFileTx(tx *bolt.Tx, rel string) error {
 	}
 	if fm.Nlink > 1 {
 		fm.Nlink--
+		// Repoint Rel if the deleted path was the one it tracked.
+		// findPathForInodeTx is O(N) over the paths bucket but only fires
+		// on hardlink unlink (rare) and only when the unlink hits the
+		// primary path.
+		if fm.Rel == rel {
+			survivor, ferr := findPathForInodeTx(tx, id)
+			if ferr != nil {
+				return ferr
+			}
+			if survivor != "" {
+				fm.Rel = survivor
+			}
+			// If no survivor was found despite Nlink>1, the paths bucket
+			// is inconsistent with Nlink — leave Rel as-is (stale) and
+			// proceed; the startup repair pass will sweep it up.
+		}
 		enc, eerr := encodeFileMeta(fm)
 		if eerr != nil {
 			return eerr
