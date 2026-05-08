@@ -38,6 +38,13 @@ type Compactor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// preSwapHookForTest fires inside replicateOne after all chunk Appends
+	// have flushed to disk but before the metadata swap-in tx runs. The
+	// audit suite uses it to mutate fm.Version mid-flight so the swap aborts
+	// with errVersionChanged, exercising the orphan-bytes bookkeeping path.
+	// nil in production.
+	preSwapHookForTest func(id uint64)
 }
 
 func NewCompactor(reader *Reader, hotSegs, coldSegs *SegmentSet, meta *Meta, ev *Evictor, replicateAfter time.Duration, replicateMaxBytes int64, dbg dbg) *Compactor {
@@ -310,6 +317,10 @@ func (c *Compactor) replicateOne(id uint64) error {
 		}
 	}
 
+	if c.preSwapHookForTest != nil {
+		c.preSwapHookForTest(id)
+	}
+
 	// Atomically swap in the new cold fragments. Look up by inodeID so we
 	// don't get tripped up by a path-bucket mutation that happened
 	// mid-flight (rename, unlink-of-hardlink).
@@ -370,7 +381,47 @@ func (c *Compactor) replicateOne(id uint64) error {
 		return putInodeTx(tx, id, fm2)
 	})
 	if err == errVersionChanged {
-		c.dbg.log("Replicate %q: version changed mid-flight, aborting", rel)
+		// The swap-in tx aborted, but seg.Append already wrote our chunks to
+		// the active cold segment(s). Without bookkeeping, sm.Total stays
+		// behind seg.size by exactly the orphan framed bytes; subsequent
+		// successful replicates append past that gap and credit only their
+		// own recLen, leaving Total perpetually short. On restart, reconcile
+		// would truncate the seg back to sm.Total — lopping off the
+		// legitimate post-orphan records along with our orphan tail.
+		//
+		// Run a follow-up tx that bumps Total (not Live — these bytes are
+		// referenced by no Fragment) so reconcile sees the real on-disk size.
+		// The orphan ranges are walked over harmlessly by forwardCompact (no
+		// inode references them) and reclaimed when the seg eventually
+		// crosses gcDeadRatio and is forward-compacted out.
+		var orphanBytes int64
+		perSeg := map[uint32]int64{}
+		for _, r := range records {
+			perSeg[r.segID] += r.recLen
+			orphanBytes += r.recLen
+		}
+		if err2 := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
+			for sid, total := range perSeg {
+				sm, err := GetSegmentTx(tx, TierCold, sid)
+				if err != nil {
+					return err
+				}
+				if sm == nil {
+					sm = &SegmentMeta{ID: sid, Tier: TierCold, CreatedAt: time.Now().UnixNano()}
+				}
+				sm.Total += total
+				// sm.Live unchanged — orphan bytes have no fragment refs.
+				if err := PutSegmentTx(tx, sm); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err2 != nil {
+			done(fs_errno(err2))
+			return fmt.Errorf("account orphan bytes after version-change on %q: %w", rel, err2)
+		}
+		c.dbg.log("Replicate %q: version changed mid-flight, %s orphan bytes accounted across %d cold seg(s)",
+			rel, humanBytes(orphanBytes), len(perSeg))
 		done(0, "raced")
 		return nil
 	}
@@ -423,6 +474,22 @@ func (c *Compactor) RunGCPass(tier Tier) {
 // constructing the full Mount stack.
 func NewCompactorForTest(reader *Reader, hotSegs, coldSegs *SegmentSet, meta *Meta, ev *Evictor) *Compactor {
 	return NewCompactor(reader, hotSegs, coldSegs, meta, ev, time.Hour, 1<<30, dbg{})
+}
+
+// ReplicateOneForTest drives the production replicateOne path for a single
+// inode synchronously. The audit suite uses this (paired with
+// SetPreSwapHookForTest) to deterministically exercise the version-change
+// race window without standing up a full background loop.
+func (c *Compactor) ReplicateOneForTest(id uint64) error {
+	return c.replicateOne(id)
+}
+
+// SetPreSwapHookForTest installs a callback that fires inside replicateOne
+// after the cold appends have flushed but before the metadata swap-in tx.
+// Tests use it to bump fm.Version (simulating a concurrent write) so the
+// swap aborts with errVersionChanged.
+func (c *Compactor) SetPreSwapHookForTest(hook func(id uint64)) {
+	c.preSwapHookForTest = hook
 }
 
 // gcPass reclaims segments in the given tier:
