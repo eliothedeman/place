@@ -392,6 +392,20 @@ const (
 	gcMaxFwdPerPass    = 8   // cap on expensive forward-compacts per tick
 )
 
+// RunGCPass triggers one synchronous gc sweep for tier. Test-only hook so
+// the audit suite can exercise the real fsync-before-unlink ordering path
+// instead of structurally re-enacting it.
+func (c *Compactor) RunGCPass(tier Tier) {
+	c.gcPass(tier)
+}
+
+// NewCompactorForTest builds a Compactor with default debug-off settings.
+// Tests use this when they need to drive gc/replicate paths without
+// constructing the full Mount stack.
+func NewCompactorForTest(reader *Reader, hotSegs, coldSegs *SegmentSet, meta *Meta, ev *Evictor) *Compactor {
+	return NewCompactor(reader, hotSegs, coldSegs, meta, ev, time.Hour, 1<<30, dbg{})
+}
+
 // gcPass reclaims segments in the given tier:
 //   - drops every fully-dead (Live==0) segment outright
 //   - forward-compacts up to gcMaxFwdPerPass partially-dead ones whose
@@ -441,19 +455,20 @@ func (c *Compactor) gcPass(tier Tier) {
 		}
 	}
 
-	// Drop fully-dead segments. Remove the segment files first (cheap
-	// fs ops, no bbolt contention), then delete every SegmentMeta in a
-	// single bbolt write tx — the prior code did one tx per segment,
-	// which throttled fully-dead reclaim to bbolt commit cadence even
-	// though the per-segment work is just a key delete.
-	for _, id := range deadIDs {
-		if err := set.Remove(id); err != nil {
-			log.Printf("place: gc remove %d: %v", id, err)
-			// Continue — we still want to drop the bbolt metadata so
-			// the segment doesn't keep showing up next pass.
-		}
-	}
+	// Drop fully-dead segments. Crash-safe ordering matters: bbolt is
+	// NoSync, so the writer txs that drove these segs to Live=0 may sit
+	// unsynced in mmap. If we unlink the .seg file before fsyncing those
+	// txs, a power loss rolls bbolt back to a state with stale live
+	// fragments pointing at the now-deleted file — bytes lost.
+	//   1. Flush so every pre-existing Live=0 transition is durable.
+	//   2. Delete the SegmentMeta entries in one batched tx.
+	//   3. Flush again to make the deletions durable.
+	//   4. Only THEN unlink the .seg files.
 	if len(deadIDs) > 0 {
+		if err := c.meta.Flush(); err != nil {
+			log.Printf("place: gc pre-delete flush: %v", err)
+			return
+		}
 		if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
 			for _, id := range deadIDs {
 				if err := DeleteSegmentTx(tx, tier, id); err != nil {
@@ -463,11 +478,23 @@ func (c *Compactor) gcPass(tier Tier) {
 			return nil
 		}); err != nil {
 			log.Printf("place: gc delete meta (batch %d): %v", len(deadIDs), err)
-		} else {
-			dropped = len(deadIDs)
-			if tier == TierHot {
-				c.ev.Freed()
+			return
+		}
+		if err := c.meta.Flush(); err != nil {
+			log.Printf("place: gc post-delete flush: %v", err)
+			return
+		}
+		for _, id := range deadIDs {
+			if err := set.Remove(id); err != nil {
+				log.Printf("place: gc remove %d: %v", id, err)
+				// Continue — meta is already detached, so a residual
+				// .seg file is harmless dead space; a later reconcile
+				// or restart will drop it.
 			}
+		}
+		dropped = len(deadIDs)
+		if tier == TierHot {
+			c.ev.Freed()
 		}
 	}
 
@@ -545,15 +572,33 @@ func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 		}
 	}
 
-	// Remove the old segment.
-	if err := set.Remove(target.ID); err != nil {
-		log.Printf("place: gc remove %d: %v", target.ID, err)
+	// Crash-safe teardown of the source segment. bbolt is NoSync, so the
+	// rewriteRefs txs that pointed FileMetas at the new locations are still
+	// unsynced. We MUST fsync them (and the upcoming SegmentMeta delete)
+	// before unlinking the .seg file — otherwise a crash rolls bbolt back
+	// to FileMetas that still reference target.ID while the file is gone.
+	//   1. Flush so the relocations land in the on-disk db.
+	//   2. Delete the source SegmentMeta in its own tx.
+	//   3. Flush so the delete is durable.
+	//   4. Only THEN unlink the .seg file.
+	if err := c.meta.Flush(); err != nil {
+		log.Printf("place: gc pre-delete flush %d: %v", target.ID, err)
 		return
 	}
 	if err := c.meta.UpdateLocked(func(tx *bolt.Tx) error {
 		return DeleteSegmentTx(tx, tier, target.ID)
 	}); err != nil {
 		log.Printf("place: gc delete meta %d: %v", target.ID, err)
+		return
+	}
+	if err := c.meta.Flush(); err != nil {
+		log.Printf("place: gc post-delete flush %d: %v", target.ID, err)
+		return
+	}
+	if err := set.Remove(target.ID); err != nil {
+		log.Printf("place: gc remove %d: %v", target.ID, err)
+		// Don't bail — bbolt no longer references this segment, so the
+		// stray file is dead space; reconcile will drop it on restart.
 	}
 	if tier == TierHot {
 		c.ev.Freed()

@@ -58,6 +58,11 @@ func NewEvictor(hot *Storage, meta *Meta, hotSegs, coldSegs *SegmentSet, evictAt
 	return e
 }
 
+// NewEvictorForTest builds an Evictor with debug off. Test-only.
+func NewEvictorForTest(hot *Storage, meta *Meta, hotSegs, coldSegs *SegmentSet, evictAt, evictTo float64) *Evictor {
+	return NewEvictor(hot, meta, hotSegs, coldSegs, evictAt, evictTo, dbg{})
+}
+
 func (e *Evictor) Start() {
 	e.wg.Add(1)
 	go e.loop()
