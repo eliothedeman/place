@@ -260,6 +260,7 @@ func (w *Writer) commitBatch(batch []*writeReq) {
 			if a.req.logicalOff+int64(len(a.req.data)) > fm.Size {
 				fm.Size = a.req.logicalOff + int64(len(a.req.data))
 			}
+			fm.ColdDirty = true
 			fm.Version++
 		}
 		for id, total := range segDeltaTotal {

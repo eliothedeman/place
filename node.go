@@ -142,6 +142,13 @@ func (n *placeNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAt
 		fm.Ctime = now
 		if sz, ok := in.GetSize(); ok {
 			newSize := int64(sz)
+			if newSize != fm.Size {
+				// Both shrink and grow desync cold from the file: shrink
+				// can leave hot newer than cold within [0, newSize) (e.g.
+				// when the trimmed range still contains an unreplicated
+				// hot write); grow extends Size past cold's coverage.
+				fm.ColdDirty = true
+			}
 			if newSize < fm.Size {
 				hotKeep, hotDead := truncateFragments(fm.HotFragments, newSize)
 				coldKeep, coldDead := truncateFragments(fm.ColdFragments, newSize)
@@ -224,6 +231,10 @@ func (n *placeNode) Create(ctx context.Context, name string, flags uint32, mode 
 				existing.Size = 0
 				existing.Mtime = now
 				existing.Ctime = now
+				// Size==0 short-circuits HasColdCopy regardless, but
+				// flag the inode so any in-flight replicate aborts on
+				// the version-changed check rather than racing past us.
+				existing.ColdDirty = true
 				existing.Version++
 				if err := PutFileTx(tx, existing); err != nil {
 					return err
@@ -298,6 +309,7 @@ func (n *placeNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 			cur.Size = 0
 			cur.Mtime = time.Now().UnixNano()
 			cur.Ctime = cur.Mtime
+			cur.ColdDirty = true
 			cur.Version++
 			return PutFileTx(tx, cur)
 		})

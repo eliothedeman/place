@@ -116,6 +116,12 @@ type FileMeta struct {
 	ColdFragments  []Fragment // sorted by LogicalOffset, non-overlapping
 	Version        uint64
 	Nlink          uint32 // count of paths pointing at this inode (>=1 while live)
+	// ColdDirty is true when hot has bytes newer than cold for some range
+	// in [0, Size). Set on every hot mutation, cleared by replicateOne.
+	// Required because ColdFragments coverage alone doesn't say anything
+	// about whether hot has fresher bytes — without this, eviction can
+	// drop newer hot bytes in favour of stale cold bytes.
+	ColdDirty bool
 
 	// InodeID is the underlying inode identifier — populated by GetFileTx
 	// from the paths bucket lookup. Not serialized (the inodeID is the
@@ -129,11 +135,15 @@ func (fm *FileMeta) IsDir() bool     { return fm.Mode&syscall.S_IFMT == syscall.
 func (fm *FileMeta) IsLink() bool    { return fm.Mode&syscall.S_IFMT == syscall.S_IFLNK }
 func (fm *FileMeta) IsRegular() bool { return fm.Mode&syscall.S_IFMT == syscall.S_IFREG }
 
-// HasColdCopy reports whether ColdFragments cover [0, Size) contiguously.
-// When true, eviction can safely drop all HotFragments.
+// HasColdCopy reports whether ColdFragments fully cover [0, Size) AND no
+// hot mutations are outstanding (ColdDirty=false). When true, eviction can
+// safely drop all HotFragments.
 func (fm *FileMeta) HasColdCopy() bool {
 	if fm.Size == 0 {
 		return true
+	}
+	if fm.ColdDirty {
+		return false
 	}
 	var pos int64
 	for _, f := range fm.ColdFragments {
@@ -884,8 +894,11 @@ func AddLiveBytesTx(tx *bolt.Tx, frags []Fragment, delta int64) error {
 const (
 	// fileMetaVersion is the on-disk encoding version. v2 added Nlink at
 	// the tail; v1 records (read only during the V0→V1 schema migration)
-	// default Nlink=1 on decode.
-	fileMetaVersion   byte = 2
+	// default Nlink=1 on decode. v3 adds ColdDirty; v2 records default
+	// ColdDirty=true on decode — that's the safe choice (forces a
+	// re-replicate on the next pass) since we can't tell whether hot had
+	// outstanding bytes when the v2 record was last written.
+	fileMetaVersion   byte = 3
 	segmentMetaVersion byte = 1
 )
 
@@ -904,10 +917,13 @@ func encodeFileMeta(fm *FileMeta) ([]byte, error) {
 	//   8 (Version)
 	//   4 + N*fragmentEncodedSize  (HotFragments)
 	//   4 + N*fragmentEncodedSize  (ColdFragments)
+	//   4 (Nlink, v2)
+	//   1 (ColdDirty, v3)
 	total := 1 + 2 + len(fm.Rel) + 4 + 8*4 + 4 + 4 + 2 + len(fm.LinkTarget) + 8 +
 		4 + len(fm.HotFragments)*fragmentEncodedSize +
 		4 + len(fm.ColdFragments)*fragmentEncodedSize +
-		4 // Nlink (v2)
+		4 + // Nlink (v2)
+		1 // ColdDirty (v3)
 	b := make([]byte, total)
 	p := 0
 	b[p] = fileMetaVersion
@@ -943,6 +959,10 @@ func encodeFileMeta(fm *FileMeta) ([]byte, error) {
 	}
 	le.PutUint32(b[p:], nlink)
 	p += 4
+	if fm.ColdDirty {
+		b[p] = 1
+	}
+	p++
 	return b[:p], nil
 }
 
@@ -971,7 +991,7 @@ func decodeFileMeta(b []byte) (*FileMeta, error) {
 		return nil, errors.New("empty filemeta")
 	}
 	ver := b[0]
-	if ver != 1 && ver != 2 {
+	if ver != 1 && ver != 2 && ver != 3 {
 		return nil, fmt.Errorf("unsupported filemeta version %d", ver)
 	}
 	le := binary.LittleEndian
@@ -1040,6 +1060,17 @@ func decodeFileMeta(b []byte) (*FileMeta, error) {
 		p += 4
 	} else {
 		fm.Nlink = 1 // v1 entries had no Nlink — implied 1.
+	}
+	if ver >= 3 {
+		if err := need(1); err != nil {
+			return nil, err
+		}
+		fm.ColdDirty = b[p] != 0
+		p++
+	} else {
+		// v2 records pre-date the dirty bit; we have to assume hot may
+		// have been newer than cold, so force a re-replicate.
+		fm.ColdDirty = true
 	}
 	return fm, nil
 }

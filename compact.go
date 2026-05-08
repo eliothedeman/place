@@ -321,6 +321,10 @@ func (c *Compactor) replicateOne(rel string) error {
 			})
 		}
 		fm2.ColdFragments = newCold
+		// We just rewrote cold to match the snapshot at fm1.Version; the
+		// version-changed check above guarantees no hot mutation has
+		// landed between then and now, so cold is in sync.
+		fm2.ColdDirty = false
 		// Account new cold segment bytes per touched segment.
 		perSeg := map[uint32]struct{ total, live int64 }{}
 		for _, r := range records {
