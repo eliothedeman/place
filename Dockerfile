@@ -5,7 +5,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/place ./cmd/place
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/placefs ./lib/cmd/placefs
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -13,7 +13,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && ln -sf /usr/bin/fusermount3 /usr/local/bin/fusermount
 
-COPY --from=build /out/place /usr/local/bin/place
+COPY --from=build /out/placefs /usr/local/bin/placefs
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

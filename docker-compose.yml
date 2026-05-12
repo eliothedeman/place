@@ -9,9 +9,9 @@ services:
     restart: unless-stopped
     pull_policy: always
 
-    # Shutdown can take a while if a replicate or GC pass is in flight —
-    # the binary drains both before closing bbolt. Default 10s would
-    # SIGKILL mid-pass on big filesystems.
+    # Shutdown waits for the mover loop to exit and bbolt + segments to
+    # fsync. Default 10s is usually enough; 2m is a generous safety margin
+    # if a hot→cold Move happens to be running at SIGTERM time.
     stop_signal: SIGTERM
     stop_grace_period: 2m
 
@@ -45,14 +45,24 @@ services:
         bind:
           propagation: rshared
 
-    # Extra `place mount` flags go here. Hot/cold/mount paths are wired up
-    # by docker-entrypoint.sh (which also disables --debug and --pprof-addr
-    # by default), so do NOT pass --hot/--cold/--mount. Re-enable pprof or
-    # FUSE debug by appending the flags here — last value wins.
+    # Extra placefs flags go here. Hot/cold/mount paths are wired up by
+    # docker-entrypoint.sh, so do NOT pass --hot/--cold/--mount.
+    #
+    # If you're upgrading from the legacy `place mount` binary, your existing
+    # /mnt/hot and /mnt/cold volumes still hold the old .place.db /
+    # .place/segments data; placefs auto-detects that on first start and
+    # migrates everything into the new .placefs/ layout in-place. The legacy
+    # files stay on disk until you remove them manually.
+    #
+    # Flag name changes from the legacy binary:
+    #   --evict-at / --evict-to / --replicate-after / --replicate-max-bytes
+    #       → no direct equivalents; use --hot-max-bytes / --hot-target-bytes
+    #         to bound hot tier byte usage (eviction triggers when exceeded).
+    #   --debug / --fuse-debug / --pprof-addr      → not present; add back
+    #         to lib/cmd/placefs if you need them.
+    #
     # command:
-    #   - --evict-at=0.85
-    #   - --evict-to=0.75
-    #   - --replicate-after=30m
-    #   - --replicate-max-bytes=20GB
-    #   - --pprof-addr=:6060
-    #   - --debug=true
+    #   - --hot-max-bytes=2147483648     # 2 GiB cap on hot tier
+    #   - --hot-target-bytes=1610612736  # 1.5 GiB post-evict target
+    #   - --tick=10s                     # mover poll interval
+    #   - --skip-migrate                 # if you've already migrated
