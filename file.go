@@ -61,8 +61,19 @@ func (f *placeFile) Read(ctx context.Context, dest []byte, off int64) (fuse.Read
 		// EIO with n=0. Returning an errno alongside non-zero data would
 		// be lost by the kernel anyway.
 		if n > 0 {
-			done(0, "bytes=%d partial err=%v", n, err)
+			// Surface the partial-read error in the trace as an errno so log
+			// filters catch it. We still return success to the kernel so
+			// POSIX read(2)'s short-return contract holds — callers retry at
+			// off+n and either succeed or get a hard error there.
+			done(fs_errno(err), "bytes=%d partial err=%v", n, err)
+			if m := f.root.metrics; m != nil {
+				m.ReadBytes.Add(float64(n))
+				m.ReadPartial.Inc()
+			}
 			return fuse.ReadResultData(dest[:n]), 0
+		}
+		if m := f.root.metrics; m != nil {
+			m.ReadErrors.Inc()
 		}
 		if errno, ok := err.(syscall.Errno); ok {
 			done(errno)
@@ -70,6 +81,9 @@ func (f *placeFile) Read(ctx context.Context, dest []byte, off int64) (fuse.Read
 		}
 		done(fs_errno(err))
 		return nil, fs_errno(err)
+	}
+	if m := f.root.metrics; m != nil {
+		m.ReadBytes.Add(float64(n))
 	}
 	done(0, "bytes=%d", n)
 	return fuse.ReadResultData(dest[:n]), 0
@@ -90,12 +104,18 @@ func (f *placeFile) Write(ctx context.Context, data []byte, off int64) (uint32, 
 	err := f.root.writer.Submit(f.rel, off, buf)
 	putWriteBuf(buf)
 	if err != nil {
+		if m := f.root.metrics; m != nil {
+			m.WriteErrors.Inc()
+		}
 		if errno, ok := err.(syscall.Errno); ok {
 			done(errno)
 			return 0, errno
 		}
 		done(fs_errno(err))
 		return 0, fs_errno(err)
+	}
+	if m := f.root.metrics; m != nil {
+		m.WriteBytes.Add(float64(len(data)))
 	}
 	done(0, "bytes=%d", len(data))
 	return uint32(len(data)), 0

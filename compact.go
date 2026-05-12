@@ -40,6 +40,8 @@ type Compactor struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	metrics *Metrics
+
 	// preSwapHookForTest fires inside replicateOne after all chunk Appends
 	// have flushed to disk but before the metadata swap-in tx runs. The
 	// audit suite uses it to mutate fm.Version mid-flight so the swap aborts
@@ -67,6 +69,10 @@ func NewCompactor(reader *Reader, hotSegs, coldSegs *SegmentSet, meta *Meta, ev 
 
 // AddWriteBytes is called by the Writer after each commit with the total
 // user-data bytes written. Used to drive the size-based replicate trigger.
+// SetMetrics installs a Metrics receiver for replicate/gc counters. Safe to
+// call before Start. nil disables (the default for tests).
+func (c *Compactor) SetMetrics(m *Metrics) { c.metrics = m }
+
 func (c *Compactor) AddWriteBytes(n int64) {
 	if n <= 0 {
 		return
@@ -134,6 +140,9 @@ func (c *Compactor) doReplicatePass(reason string) {
 	c.mu.Unlock()
 	c.dbg.log("compact: replicate pass (reason=%s, bytes=%s, since=%v)",
 		reason, humanBytes(c.bytesSince.Load()), since.Round(time.Second))
+	if m := c.metrics; m != nil {
+		m.ReplicatePasses.WithLabelValues(reason).Inc()
+	}
 	c.replicatePass()
 	c.mu.Lock()
 	c.lastReplicateAt = time.Now()
@@ -443,12 +452,26 @@ func (c *Compactor) replicateOne(id uint64) error {
 		}
 		c.dbg.log("Replicate %q: version changed mid-flight, %s orphan bytes accounted across %d cold seg(s)",
 			rel, humanBytes(orphanBytes), len(perSeg))
+		if m := c.metrics; m != nil {
+			m.ReplicateOrphanBytes.Add(float64(orphanBytes))
+		}
 		done(0, "raced")
 		return nil
 	}
 	if err != nil {
+		if m := c.metrics; m != nil {
+			m.ReplicateErrors.Inc()
+		}
 		done(fs_errno(err))
 		return err
+	}
+	if m := c.metrics; m != nil {
+		var bytes int64
+		for _, r := range records {
+			bytes += r.length
+		}
+		m.ReplicateFiles.Inc()
+		m.ReplicateBytes.Add(float64(bytes))
 	}
 	done(0, "size=%s chunks=%d", humanBytes(size), len(records))
 	c.ev.Freed()
@@ -524,6 +547,9 @@ func (c *Compactor) SetPreSwapHookForTest(hook func(id uint64)) {
 // formerly-active seg into a delete candidate behind our backs — see
 // the inline comment on the second sample for the failure mode.
 func (c *Compactor) gcPass(tier Tier) {
+	if m := c.metrics; m != nil {
+		m.GCPasses.WithLabelValues(tierLabel(tier)).Inc()
+	}
 	segs, err := c.meta.ListSegments(tier)
 	if err != nil {
 		log.Printf("place: gc list segments: %v", err)
@@ -546,6 +572,7 @@ func (c *Compactor) gcPass(tier Tier) {
 	dropped := 0
 
 	var deadIDs []uint32
+	var deadBytes int64
 	for _, sm := range segs {
 		select {
 		case <-c.ctx.Done():
@@ -560,6 +587,7 @@ func (c *Compactor) gcPass(tier Tier) {
 		}
 		if sm.Live == 0 {
 			deadIDs = append(deadIDs, sm.ID)
+			deadBytes += sm.Total
 			continue
 		}
 		dead := float64(sm.Total-sm.Live) / float64(sm.Total)
@@ -639,6 +667,11 @@ func (c *Compactor) gcPass(tier Tier) {
 
 	if dropped > 0 {
 		c.dbg.log("gc: dropped %d fully-dead segments (tier=%d)", dropped, tier)
+		if m := c.metrics; m != nil {
+			lbl := tierLabel(tier)
+			m.GCSegmentsRemoved.WithLabelValues(lbl).Add(float64(dropped))
+			m.GCBytesReclaimed.WithLabelValues(lbl).Add(float64(deadBytes))
+		}
 	}
 
 	// Forward-compact the deadest partials, up to the per-pass cap.
@@ -672,6 +705,16 @@ func (c *Compactor) gcPass(tier Tier) {
 func (c *Compactor) forwardCompact(tier Tier, target *SegmentMeta) {
 	c.dbg.log("gc: forward-compact segment %d tier=%d (live=%s total=%s)",
 		target.ID, tier, humanBytes(target.Live), humanBytes(target.Total))
+	if m := c.metrics; m != nil {
+		lbl := tierLabel(tier)
+		m.GCForwardCompacts.WithLabelValues(lbl).Inc()
+		// Reclaimed = dead bytes; live bytes are merely copied to the active
+		// segment of the same tier, not freed.
+		reclaimed := target.Total - target.Live
+		if reclaimed > 0 {
+			m.GCBytesReclaimed.WithLabelValues(lbl).Add(float64(reclaimed))
+		}
+	}
 
 	set := c.hotSegs
 	if tier == TierCold {

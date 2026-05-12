@@ -99,10 +99,11 @@ func (m *mount) Run(args []string) {
 	}
 
 	if m.PprofAddr != "" {
+		http.Handle("/metrics", server.MetricsHandler())
 		go func() {
-			log.Printf("place: pprof listening on %s", m.PprofAddr)
+			log.Printf("place: pprof+metrics listening on %s (/debug/pprof, /metrics)", m.PprofAddr)
 			if err := http.ListenAndServe(m.PprofAddr, nil); err != nil {
-				log.Printf("place: pprof server: %v", err)
+				log.Printf("place: http server: %v", err)
 			}
 		}()
 	}
@@ -208,9 +209,70 @@ func (c *migrateCmd) Run(args []string) {
 	}
 }
 
+type auditCmd struct {
+	Hot  string `help:"path to hot storage directory"`
+	Cold string `help:"path to cold storage directory"`
+	DB   string `help:"path to meta.db (default: {hot}/.place/meta.db)"`
+}
+
+func (c *auditCmd) Help() string {
+	return "Verify every Fragment in meta.db points within its segment file on disk. Reports dangling Fragments (missing segment or fragment past EOF). The filesystem must not be mounted — meta.db's bbolt lock is exclusive."
+}
+
+func (c *auditCmd) Run(args []string) {
+	if c.Hot == "" {
+		log.Fatal("--hot is required")
+	}
+	if c.Cold == "" {
+		log.Fatal("--cold is required")
+	}
+	dbPath := c.DB
+	if dbPath == "" {
+		dbPath = c.Hot + "/.place/meta.db"
+	}
+
+	meta, err := place.NewMeta(dbPath)
+	if err != nil {
+		log.Fatalf("open meta: %v", err)
+	}
+	defer meta.Close()
+
+	hotSegs, err := place.NewSegmentSet(place.TierHot, c.Hot, 1<<30)
+	if err != nil {
+		log.Fatalf("open hot segs: %v", err)
+	}
+	defer hotSegs.CloseAll()
+	coldSegs, err := place.NewSegmentSet(place.TierCold, c.Cold, 1<<30)
+	if err != nil {
+		log.Fatalf("open cold segs: %v", err)
+	}
+	defer coldSegs.CloseAll()
+
+	findings, err := place.Audit(meta, hotSegs, coldSegs)
+	if err != nil {
+		log.Fatalf("audit: %v", err)
+	}
+	for _, f := range findings {
+		fmt.Println(f)
+	}
+	hot, cold := 0, 0
+	for _, f := range findings {
+		if f.Tier == place.TierHot {
+			hot++
+		} else {
+			cold++
+		}
+	}
+	fmt.Printf("audit: %d findings (%d hot, %d cold)\n", len(findings), hot, cold)
+	if len(findings) > 0 {
+		os.Exit(1)
+	}
+}
+
 func main() {
 	quack.MustBindCobra("place", quack.Map{
 		"mount":   new(mount),
 		"migrate": new(migrateCmd),
+		"audit":   new(auditCmd),
 	}).Execute()
 }

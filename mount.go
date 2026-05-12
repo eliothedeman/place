@@ -1,8 +1,10 @@
 package place
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	bolt "go.etcd.io/bbolt"
 )
 
 const defaultSegmentSize = 256 << 20 // 256MB
@@ -43,11 +46,23 @@ type Server struct {
 	writer  *Writer
 	compact *Compactor
 	evict   *Evictor
+	hotStor *Storage
 	hotSegs *SegmentSet
 	coldSegs *SegmentSet
 	dbg     dbg
 
+	metrics    *Metrics
+	metricsCtx context.Context
+	metricsCancel context.CancelFunc
+	metricsWG  sync.WaitGroup
+
 	closeOnce sync.Once
+}
+
+// MetricsHandler returns the HTTP handler that serves Prometheus exposition
+// for this Server. Hand it to your http.ServeMux at /metrics.
+func (s *Server) MetricsHandler() http.Handler {
+	return s.metrics.Handler()
 }
 
 // RecoverStaleMount detects and cleans up a stale FUSE mount at the given
@@ -192,6 +207,11 @@ func Mount(cfg Config) (*Server, error) {
 	compact := NewCompactor(reader, hotSegs, coldSegs, meta, evict, replicateAfter, replicateMaxBytes, d)
 	writer.SetCompactor(compact)
 
+	metrics := NewMetrics()
+	writer.SetMetrics(metrics)
+	compact.SetMetrics(metrics)
+	evict.SetMetrics(metrics)
+
 	root := &placeRoot{
 		hot:      hot,
 		cold:     cold,
@@ -203,6 +223,7 @@ func Mount(cfg Config) (*Server, error) {
 		compact:  compact,
 		evict:    evict,
 		dbg:      d,
+		metrics:  metrics,
 	}
 
 	mopts := fuse.MountOptions{
@@ -235,17 +256,84 @@ func Mount(cfg Config) (*Server, error) {
 	evict.Start()
 	compact.Start()
 
-	return &Server{
-		fuse:     server,
-		meta:     meta,
-		writer:   writer,
-		compact:  compact,
-		evict:    evict,
-		hotSegs:  hotSegs,
-		coldSegs: coldSegs,
-		dbg:      d,
-	}, nil
+	mctx, mcancel := context.WithCancel(context.Background())
+	srv := &Server{
+		fuse:          server,
+		meta:          meta,
+		writer:        writer,
+		compact:       compact,
+		evict:         evict,
+		hotStor:       hot,
+		hotSegs:       hotSegs,
+		coldSegs:      coldSegs,
+		dbg:           d,
+		metrics:       metrics,
+		metricsCtx:    mctx,
+		metricsCancel: mcancel,
+	}
+	srv.startMetricsLoop()
+	return srv, nil
 }
+
+// startMetricsLoop samples gauges periodically. Counters are bumped at their
+// call sites and don't need a sampler.
+func (s *Server) startMetricsLoop() {
+	s.metricsWG.Add(1)
+	go func() {
+		defer s.metricsWG.Done()
+		// 10s cadence: gauges are read by scrapers at 15s typical, and the
+		// underlying bbolt View + statfs are cheap.
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		s.sampleGauges() // initial sample so /metrics has data immediately
+		for {
+			select {
+			case <-s.metricsCtx.Done():
+				return
+			case <-t.C:
+				s.sampleGauges()
+			}
+		}
+	}()
+}
+
+// sampleGauges refreshes the gauge collectors from the current Meta and
+// Storage state. Logs and swallows errors — a metrics scrape returning stale
+// values is preferable to crashing the loop.
+func (s *Server) sampleGauges() {
+	m := s.metrics
+	m.HotUsedFraction.Set(s.hotStor.UsedFraction())
+
+	for _, tier := range []Tier{TierHot, TierCold} {
+		lbl := tierLabel(tier)
+		segs, err := s.meta.ListSegments(tier)
+		if err != nil {
+			log.Printf("place: sampleGauges list %s: %v", lbl, err)
+			continue
+		}
+		var total, live int64
+		for _, sm := range segs {
+			total += sm.Total
+			live += sm.Live
+		}
+		m.Segments.WithLabelValues(lbl).Set(float64(len(segs)))
+		m.SegmentTotalBytes.WithLabelValues(lbl).Set(float64(total))
+		m.SegmentLiveBytes.WithLabelValues(lbl).Set(float64(live))
+	}
+
+	var inodeN int64
+	if err := s.meta.ViewLocked(func(tx *bolt.Tx) error {
+		if b := tx.Bucket(bucketInodes); b != nil {
+			inodeN = int64(b.Stats().KeyN)
+		}
+		return nil
+	}); err != nil {
+		log.Printf("place: sampleGauges inodes: %v", err)
+	} else {
+		m.Inodes.Set(float64(inodeN))
+	}
+}
+
 
 func durPtr(d time.Duration) *time.Duration { return &d }
 
@@ -265,6 +353,10 @@ func (s *Server) Unmount() {
 func (s *Server) shutdown() {
 	s.closeOnce.Do(func() {
 		log.Println("place: shutting down...")
+		if s.metricsCancel != nil {
+			s.metricsCancel()
+			s.metricsWG.Wait()
+		}
 		s.compact.Stop()
 		s.evict.Stop()
 		if err := s.writer.Close(); err != nil {

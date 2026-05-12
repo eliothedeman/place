@@ -63,7 +63,12 @@ type Writer struct {
 
 	flushInterval time.Duration // overlay drain → bbolt (no fsync)
 	syncInterval  time.Duration // full fsync (segments + bbolt)
+
+	metrics *Metrics
 }
+
+// SetMetrics installs a Metrics receiver. Safe to call before any Submit.
+func (w *Writer) SetMetrics(m *Metrics) { w.metrics = m }
 
 func NewWriter(hot *SegmentSet, meta *Meta, ev *Evictor) *Writer {
 	w := &Writer{

@@ -23,6 +23,7 @@ type placeRoot struct {
 	compact  *Compactor
 	evict    *Evictor
 	dbg      dbg
+	metrics  *Metrics
 }
 
 type placeNode struct {

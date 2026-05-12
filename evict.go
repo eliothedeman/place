@@ -38,7 +38,12 @@ type Evictor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	metrics *Metrics
 }
+
+// SetMetrics installs a Metrics receiver. Safe to call before Start.
+func (e *Evictor) SetMetrics(m *Metrics) { e.metrics = m }
 
 func NewEvictor(hot *Storage, meta *Meta, hotSegs, coldSegs *SegmentSet, evictAt, evictTo float64, dbg dbg) *Evictor {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,6 +90,9 @@ func (e *Evictor) Admit(size int64) error {
 	}
 	if usage >= tier3Start {
 		e.kick()
+		if m := e.metrics; m != nil {
+			m.EvictAdmitBlocked.Inc()
+		}
 		return syscall.ENOSPC
 	}
 	// Tier 2: wait on progress up to admitWait.
@@ -109,6 +117,9 @@ func (e *Evictor) Admit(size int64) error {
 		case <-deadline.C:
 			if e.hot.UsedFraction() < tier2Start {
 				return nil
+			}
+			if m := e.metrics; m != nil {
+				m.EvictAdmitBlocked.Inc()
 			}
 			return syscall.ENOSPC
 		}
@@ -221,6 +232,9 @@ func (e *Evictor) dropCached() int64 {
 	}
 	if freed > 0 {
 		e.Freed()
+		if m := e.metrics; m != nil {
+			m.EvictBytesDropped.Add(float64(freed))
+		}
 		e.dbg.log("evict: freed %s of hot by dropping cached fragments", humanBytes(freed))
 	} else {
 		e.dbg.log("evict: nothing to drop yet (%d candidates scanned, none with full cold copy)", len(candidates))
