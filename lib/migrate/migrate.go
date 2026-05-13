@@ -19,8 +19,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"time"
 
 	oldplace "github.com/eliothedeman/place"
+	"github.com/eliothedeman/place/lib/index"
 	"github.com/eliothedeman/place/lib/store"
 )
 
@@ -83,9 +85,27 @@ type Options struct {
 	// old SegmentSet objects can be constructed; reads ignore it. Defaults
 	// to 1 GiB which is fine even if the real value was different.
 	OldSegmentMaxSize int64
-	// Logger receives one line per migrated file/dir/symlink. Defaults to
-	// log.Printf with a "migrate: " prefix.
+	// TargetTier is the tier migrated bytes land in. Defaults to TierCold
+	// so a bulk migration doesn't fill up the (typically smaller) hot
+	// drive. Operators that want migrated data hot-cached can set this to
+	// TierHot, but it requires hot to have room for the full dataset.
+	TargetTier index.Tier
+	// ProgressInterval is how often the migrator emits a "progress: X files,
+	// Y bytes, Z MB/s" line. Defaults to 10 seconds. Set to a very large
+	// value (or use a no-op Logger) to silence.
+	ProgressInterval time.Duration
+	// Cleanup, if true, deletes the legacy DB and .place/segments tree
+	// after a successful migration. Defaults to false so an operator can
+	// verify the new dataset before discarding the source.
+	Cleanup bool
+	// Logger receives one line per migrated file/dir/symlink/hardlink as
+	// well as periodic progress lines. Defaults to log.Printf with a
+	// "migrate: " prefix. Pass a no-op for silent runs.
 	Logger func(format string, args ...any)
+	// Verbose, when true, also logs every individual file/dir/symlink as it
+	// migrates. When false (default), only progress lines + start/finish
+	// messages are emitted.
+	Verbose bool
 }
 
 // Run executes the migration. dst must be an already-open Store; ideally
@@ -100,6 +120,12 @@ func Run(dst *store.Store, opts Options) (Stats, error) {
 	}
 	if opts.OldSegmentMaxSize <= 0 {
 		opts.OldSegmentMaxSize = 1 << 30
+	}
+	if opts.TargetTier == 0 {
+		opts.TargetTier = index.TierCold
+	}
+	if opts.ProgressInterval == 0 {
+		opts.ProgressInterval = 10 * time.Second
 	}
 	logf := opts.Logger
 	if logf == nil {
@@ -139,18 +165,50 @@ func Run(dst *store.Store, opts Options) (Stats, error) {
 
 	reader := oldplace.NewReader(hot, cold, oldMeta)
 
+	logf("target tier: %s", opts.TargetTier)
 	m := &migrator{
-		dst:       dst,
-		oldMeta:   oldMeta,
-		reader:    reader,
-		chunkSize: opts.ChunkSize,
-		inodeMap:  map[uint64]uint64{},
-		logf:      logf,
+		dst:              dst,
+		oldMeta:          oldMeta,
+		reader:           reader,
+		chunkSize:        opts.ChunkSize,
+		targetTier:       opts.TargetTier,
+		progressInterval: opts.ProgressInterval,
+		startedAt:        time.Now(),
+		lastProgress:     time.Now(),
+		inodeMap:         map[uint64]uint64{},
+		logf:             logf,
+		verbose:          opts.Verbose,
 	}
 	if err := m.walk("", store.RootInode); err != nil {
 		return m.stats, err
 	}
+	m.emitProgress("done")
+
+	if opts.Cleanup {
+		if err := cleanupLegacy(opts.OldHot, opts.OldCold, dbPath, logf); err != nil {
+			return m.stats, fmt.Errorf("migrate: cleanup: %w", err)
+		}
+	}
 	return m.stats, nil
+}
+
+// cleanupLegacy removes the legacy DB and the .place/ subtree under hot
+// and cold. Run only after a successful migration when opts.Cleanup is set.
+func cleanupLegacy(hot, cold, dbPath string, logf func(string, ...any)) error {
+	for _, p := range []string{
+		dbPath,
+		filepath.Join(hot, ".place"),
+		filepath.Join(cold, ".place"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("remove %s: %w", p, err)
+		}
+		logf("cleanup: removed %s", p)
+	}
+	return nil
 }
 
 // Stats reports what was migrated.
@@ -163,13 +221,39 @@ type Stats struct {
 }
 
 type migrator struct {
-	dst       *store.Store
-	oldMeta   *oldplace.Meta
-	reader    *oldplace.Reader
-	chunkSize int
-	inodeMap  map[uint64]uint64 // old inode id → new inode id
-	stats     Stats
-	logf      func(format string, args ...any)
+	dst              *store.Store
+	oldMeta          *oldplace.Meta
+	reader           *oldplace.Reader
+	chunkSize        int
+	targetTier       index.Tier
+	progressInterval time.Duration
+	startedAt        time.Time
+	lastProgress     time.Time
+	inodeMap         map[uint64]uint64 // old inode id → new inode id
+	stats            Stats
+	logf             func(format string, args ...any)
+	verbose          bool
+}
+
+// emitProgress prints "progress: X files, Y bytes (rate=Z MB/s)" using the
+// running totals. The status arg goes on the same line ("done" at the
+// end). Always emits regardless of progressInterval — callers throttle via
+// maybeProgress.
+func (m *migrator) emitProgress(status string) {
+	dt := time.Since(m.startedAt).Seconds()
+	if dt <= 0 {
+		dt = 0.001
+	}
+	mbs := float64(m.stats.Bytes) / 1024 / 1024 / dt
+	m.logf("progress (%s): %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes (%.1f MB/s avg)",
+		status, m.stats.Files, m.stats.Dirs, m.stats.Symlinks, m.stats.Hardlinks, m.stats.Bytes, mbs)
+	m.lastProgress = time.Now()
+}
+
+func (m *migrator) maybeProgress() {
+	if m.progressInterval > 0 && time.Since(m.lastProgress) >= m.progressInterval {
+		m.emitProgress("running")
+	}
 }
 
 func (m *migrator) walk(oldParentRel string, newParent uint64) error {
@@ -186,7 +270,9 @@ func (m *migrator) walk(oldParentRel string, newParent uint64) error {
 				return fmt.Errorf("migrate: Mkdir(%q): %w", fm.Rel, err)
 			}
 			m.stats.Dirs++
-			m.logf("dir   %s", "/"+fm.Rel)
+			if m.verbose {
+				m.logf("dir   %s", "/"+fm.Rel)
+			}
 			if err := m.walk(fm.Rel, n.Inode); err != nil {
 				return err
 			}
@@ -195,14 +281,18 @@ func (m *migrator) walk(oldParentRel string, newParent uint64) error {
 				return fmt.Errorf("migrate: Symlink(%q): %w", fm.Rel, err)
 			}
 			m.stats.Symlinks++
-			m.logf("link  %s → %s", "/"+fm.Rel, fm.LinkTarget)
+			if m.verbose {
+				m.logf("link  %s → %s", "/"+fm.Rel, fm.LinkTarget)
+			}
 		case fm.IsRegular():
 			if existing, ok := m.inodeMap[fm.InodeID]; ok && fm.InodeID != 0 {
 				if _, err := m.dst.Link(existing, newParent, name); err != nil {
 					return fmt.Errorf("migrate: Link(%q): %w", fm.Rel, err)
 				}
 				m.stats.Hardlinks++
-				m.logf("hard  %s → inode %d", "/"+fm.Rel, existing)
+				if m.verbose {
+					m.logf("hard  %s → inode %d", "/"+fm.Rel, existing)
+				}
 				continue
 			}
 			newNode, h, err := m.dst.Create(newParent, name, store.Mode(fm.Mode))
@@ -220,11 +310,14 @@ func (m *migrator) walk(oldParentRel string, newParent uint64) error {
 			m.inodeMap[fm.InodeID] = newNode.Inode
 			m.stats.Files++
 			m.stats.Bytes += n
-			m.logf("file  %s (%d bytes)", "/"+fm.Rel, n)
+			if m.verbose {
+				m.logf("file  %s (%d bytes)", "/"+fm.Rel, n)
+			}
 		default:
 			// Unknown mode — skip with a log so the migration completes.
 			m.logf("skip  %s (mode=%o)", "/"+fm.Rel, fm.Mode)
 		}
+		m.maybeProgress()
 	}
 	return nil
 }
@@ -247,14 +340,19 @@ func (m *migrator) copyFile(h *store.Handle, fm *oldplace.FileMeta) (int64, erro
 		if rn == 0 {
 			break
 		}
-		if _, werr := h.WriteAt(buf[:rn], off); werr != nil {
+		if _, werr := h.WriteAtTier(buf[:rn], off, m.targetTier); werr != nil {
 			return total, werr
 		}
 		off += int64(rn)
 		total += int64(rn)
+		m.stats.Bytes += int64(rn)
+		m.maybeProgress()
 		if err == io.EOF {
 			break
 		}
 	}
+	// We bumped m.stats.Bytes inside the loop for periodic progress; subtract
+	// it back out here so walk's "m.stats.Bytes += n" doesn't double-count.
+	m.stats.Bytes -= total
 	return total, h.Sync()
 }

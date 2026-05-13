@@ -257,6 +257,98 @@ func TestSameDirUpgradeFlow(t *testing.T) {
 	}
 }
 
+// TestMigratorWritesToCold verifies the default target tier puts migrated
+// bytes in cold, leaving hot segments empty. This is what makes a bulk
+// upgrade safe when the hot drive is much smaller than the dataset.
+func TestMigratorWritesToCold(t *testing.T) {
+	oldHot, oldCold, _ := makeOldFixture(t)
+	newRoot := t.TempDir()
+	idx, err := index.Open(index.Config{Root: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := migrate.Run(st, migrate.Options{
+		OldHot: oldHot, OldCold: oldCold,
+		Logger: func(string, ...any) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk every stripe; none should have hot bytes.
+	err = idx.IterStripes(func(s index.StripeInfo) bool {
+		if s.HotBytes > 0 {
+			t.Errorf("inode=%d stripe=%d landed %d hot bytes; default migrate should write to cold",
+				s.Inode, s.StripeID, s.HotBytes)
+		}
+		if s.ColdBytes == 0 {
+			t.Errorf("inode=%d stripe=%d has no cold bytes; migrate didn't write to cold",
+				s.Inode, s.StripeID)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMigratorCleanupRemovesLegacyFiles verifies that --migrate-cleanup
+// deletes the legacy DB and segments on a successful run, and that the
+// new dataset is still readable after.
+func TestMigratorCleanupRemovesLegacyFiles(t *testing.T) {
+	oldHot, oldCold, expected := makeOldFixture(t)
+	newRoot := t.TempDir()
+	idx, err := index.Open(index.Config{Root: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := migrate.Run(st, migrate.Options{
+		OldHot: oldHot, OldCold: oldCold,
+		Cleanup: true,
+		Logger:  func(string, ...any) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Legacy files should be gone.
+	if _, err := os.Stat(filepath.Join(oldHot, ".place.db")); !os.IsNotExist(err) {
+		t.Errorf(".place.db not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(oldHot, ".place")); !os.IsNotExist(err) {
+		t.Errorf(".place dir not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(oldCold, ".place")); !os.IsNotExist(err) {
+		t.Errorf("cold .place dir not removed: %v", err)
+	}
+
+	// New dataset still works.
+	for rel, want := range expected {
+		n, err := st.LookupPath("/" + rel)
+		if err != nil {
+			t.Errorf("post-cleanup lookup %s: %v", rel, err)
+			continue
+		}
+		h, _ := st.OpenInode(n.Inode, 0)
+		got := make([]byte, len(want))
+		h.ReadAt(got, 0)
+		h.Close()
+		if !bytes.Equal(got, want) {
+			t.Errorf("post-cleanup content mismatch for %s", rel)
+		}
+	}
+}
+
 func TestMigratorRejectsMissingOldData(t *testing.T) {
 	newRoot := t.TempDir()
 	idx, err := index.Open(index.Config{Root: newRoot})

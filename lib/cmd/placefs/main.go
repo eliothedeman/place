@@ -39,6 +39,8 @@ func main() {
 	segMax := flag.Int64("segment-max", index.DefaultSegmentMaxSize, "segment rotation size in bytes")
 	skipMigrate := flag.Bool("skip-migrate", false, "do not run the old→new migrator even if old data is detected")
 	migOldDB := flag.String("migrate-old-db", "", "explicit path to the legacy DB (overrides auto-detection)")
+	migTarget := flag.String("migrate-target", "cold", "tier migrated bytes land in: hot or cold (default cold so a bulk migration doesn't fill the hot drive)")
+	migCleanup := flag.Bool("migrate-cleanup", false, "delete legacy .place.db and .place/ tree after a successful migration (default keeps them so you can verify)")
 	verbose := flag.Bool("verbose", false, "log every migrated file/dir/symlink and every mover decision")
 	flag.Parse()
 
@@ -77,7 +79,12 @@ func main() {
 	if *skipMigrate {
 		log.Printf("placefs: skip-migrate set; not scanning for legacy data")
 	} else {
-		runMigration(st, *hot, *cold, *migOldDB, *verbose)
+		tier, err := parseTier(*migTarget)
+		if err != nil {
+			st.Close()
+			log.Fatalf("placefs: -migrate-target: %v", err)
+		}
+		runMigration(st, *hot, *cold, *migOldDB, tier, *migCleanup, *verbose)
 	}
 
 	mv := mover.Start(mover.Config{
@@ -125,12 +132,12 @@ func storeIsEmpty(s *store.Store) (bool, error) {
 }
 
 // runMigration logs each branch so a quiet startup is self-explanatory.
-func runMigration(st *store.Store, hot, cold, explicitDB string, verbose bool) {
+func runMigration(st *store.Store, hot, cold, explicitDB string, target index.Tier, cleanup, verbose bool) {
 	if explicitDB != "" {
 		// Operator pinned the legacy DB path explicitly. Run regardless of
 		// what auto-detect would have said.
 		log.Printf("placefs: -migrate-old-db=%s; running migrator", explicitDB)
-		doMigrate(st, hot, cold, explicitDB, verbose)
+		doMigrate(st, hot, cold, explicitDB, target, cleanup, verbose)
 		return
 	}
 	dbPath, dbFound := migrate.FindLegacyDB(hot)
@@ -159,29 +166,47 @@ func runMigration(st *store.Store, hot, cold, explicitDB string, verbose bool) {
 		log.Printf("placefs: legacy data at %s but new store is non-empty; skipping migration (pass -skip-migrate to silence this)", hot)
 		return
 	}
-	log.Printf("placefs: legacy data found (db=%s, segments=%s) — running migrator", dbPath, segDir)
-	doMigrate(st, hot, cold, dbPath, verbose)
+	log.Printf("placefs: legacy data found (db=%s, segments=%s) — running migrator (target=%s, cleanup=%v)",
+		dbPath, segDir, target, cleanup)
+	doMigrate(st, hot, cold, dbPath, target, cleanup, verbose)
 }
 
-func doMigrate(st *store.Store, hot, cold, dbPath string, verbose bool) {
-	logf := func(string, ...any) {}
-	if verbose {
-		logf = func(format string, args ...any) {
-			log.Printf("placefs: migrate: "+format, args...)
-		}
+func doMigrate(st *store.Store, hot, cold, dbPath string, target index.Tier, cleanup, verbose bool) {
+	// Always-on logger so the operator sees periodic progress lines even
+	// without -verbose. -verbose adds per-file detail on top.
+	logf := func(format string, args ...any) {
+		log.Printf("placefs: migrate: "+format, args...)
 	}
 	stats, err := migrate.Run(st, migrate.Options{
-		OldHot:  hot,
-		OldCold: cold,
-		OldDB:   dbPath,
-		Logger:  logf,
+		OldHot:     hot,
+		OldCold:    cold,
+		OldDB:      dbPath,
+		TargetTier: target,
+		Cleanup:    cleanup,
+		Logger:     logf,
+		Verbose:    verbose,
 	})
 	if err != nil {
 		st.Close()
 		log.Fatalf("migrate: %v", err)
 	}
-	log.Printf("placefs: migration complete — %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes (old data still on disk under .place/; delete when you're satisfied)",
-		stats.Files, stats.Dirs, stats.Symlinks, stats.Hardlinks, stats.Bytes)
+	suffix := "(legacy data left in place — pass -migrate-cleanup to delete)"
+	if cleanup {
+		suffix = "(legacy files deleted)"
+	}
+	log.Printf("placefs: migration complete — %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes %s",
+		stats.Files, stats.Dirs, stats.Symlinks, stats.Hardlinks, stats.Bytes, suffix)
+}
+
+func parseTier(s string) (index.Tier, error) {
+	switch s {
+	case "hot":
+		return index.TierHot, nil
+	case "cold":
+		return index.TierCold, nil
+	default:
+		return 0, fmt.Errorf("unknown tier %q (want hot or cold)", s)
+	}
 }
 
 func dirExists(path string) bool {

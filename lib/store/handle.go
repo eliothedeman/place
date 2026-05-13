@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/eliothedeman/place/lib/index"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -54,13 +55,20 @@ func (h *Handle) ReadAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
-// WriteAt writes p at off. The file grows if off+len(p) exceeds current size.
-// Mtime/Ctime are bumped.
+// WriteAt writes p at off into the default hot tier. The file grows if
+// off+len(p) exceeds current size. Mtime/Ctime are bumped.
 func (h *Handle) WriteAt(p []byte, off int64) (int, error) {
+	return h.WriteAtTier(p, off, index.TierHot)
+}
+
+// WriteAtTier writes p at off into a specific tier. Used by bulk-ingest
+// paths (notably the legacy migrator) that want to land bytes directly in
+// cold without going through hot and triggering eviction churn.
+func (h *Handle) WriteAtTier(p []byte, off int64, tier index.Tier) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if err := h.store.idx.Append(h.inode, off, p); err != nil {
+	if err := h.store.idx.AppendTo(h.inode, off, p, tier); err != nil {
 		return 0, err
 	}
 	end := off + int64(len(p))

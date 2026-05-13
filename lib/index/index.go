@@ -229,17 +229,24 @@ func (idx *Index) setFor(tier Tier) *segment.Set {
 	return idx.hot
 }
 
-// Append writes payload at logicalOff for inode. The write may be split into
-// multiple per-stripe records if it crosses a stripe boundary; each piece
-// becomes one Fragment.
+// Append writes payload at logicalOff for inode, landing it in the hot
+// tier. The write may be split into multiple per-stripe records if it
+// crosses a stripe boundary; each piece becomes one Fragment.
+func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
+	return idx.AppendTo(inode, logicalOff, payload, segment.TierHot)
+}
+
+// AppendTo is the same as Append but lets the caller pick which tier the
+// bytes land in. Used by the migrator to write directly to cold so a bulk
+// migration doesn't fill up the (typically smaller) hot drive.
 //
 // The flow per chunk: take writeMu, write the framed record to the active
-// hot segment, fsync the segment, then in a bbolt write tx allocate a fresh
-// per-stripe seq and append the Fragment to the stripe's list. If the bbolt
-// tx fails for any reason, the bytes in the segment become orphans and GC
-// will reclaim them — the index never holds a fragment pointing at non-
-// durable bytes.
-func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
+// segment of the chosen tier, fsync the segment, then in a bbolt write tx
+// allocate a fresh per-stripe seq and append the Fragment to the stripe's
+// list. If the bbolt tx fails for any reason, the bytes in the segment
+// become orphans and GC will reclaim them — the index never holds a
+// fragment pointing at non-durable bytes.
+func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier Tier) error {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -252,7 +259,7 @@ func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
 		if off+chunkLen > stripeEnd {
 			chunkLen = stripeEnd - off
 		}
-		if err := idx.appendChunk(inode, stripeID, off, rem[:chunkLen]); err != nil {
+		if err := idx.appendChunk(inode, stripeID, off, rem[:chunkLen], tier); err != nil {
 			return err
 		}
 		rem = rem[chunkLen:]
@@ -261,7 +268,7 @@ func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
 	return nil
 }
 
-func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, payload []byte) error {
+func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, payload []byte, tier Tier) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
 
@@ -281,8 +288,9 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		return err
 	}
 
-	// Write the payload to the active hot segment + fsync.
-	seg, err := idx.hot.Active(segment.FramedSize(len(payload)))
+	// Write the payload to the active segment of the target tier + fsync.
+	set := idx.setFor(tier)
+	seg, err := set.Active(segment.FramedSize(len(payload)))
 	if err != nil {
 		return err
 	}
@@ -308,7 +316,7 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		Seq:           nextSeq,
 		LogicalOff:    logicalOff,
 		Length:        int64(len(payload)),
-		Tier:          segment.TierHot,
+		Tier:          tier,
 		SegmentID:     seg.ID(),
 		SegmentOffset: payloadOff,
 	}
