@@ -12,6 +12,9 @@ import (
 	"github.com/eliothedeman/place/lib/segment"
 )
 
+// Alias the tier constant for terser test code.
+const TierCold = index.TierCold
+
 // TestTorrentLikeRandomOrderWrites simulates a torrent client landing pieces
 // in random order at piece-aligned offsets, then verifies the assembled file
 // matches what we'd get from a sequential write.
@@ -160,6 +163,90 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("post-reopen: got %q want %q", got, want)
+	}
+}
+
+// TestBulkWriterRoundTrip exercises the bulk-ingest path used by the
+// migrator: write many chunks without per-chunk fsync, Commit once, and
+// confirm bytes/size/mtime all line up.
+func TestBulkWriterRoundTrip(t *testing.T) {
+	s := newStore(t)
+	n, h, err := s.Create(RootInode, "bulk.bin", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// Pre-write metadata, capture mtime.
+	preStat, _ := s.Stat(n.Inode)
+
+	bw := h.NewBulkWriter(TierCold)
+	chunk := bytes.Repeat([]byte("BULK"), 32<<10) // 128 KiB
+	for i := 0; i < 16; i++ {
+		if err := bw.Write(int64(i)*int64(len(chunk)), chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := bw.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	postStat, err := s.Stat(n.Inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(16) * int64(len(chunk))
+	if postStat.Size != want {
+		t.Errorf("Size=%d want %d", postStat.Size, want)
+	}
+	if postStat.Mtime <= preStat.Mtime {
+		t.Errorf("Mtime not bumped after Commit (pre=%d post=%d)", preStat.Mtime, postStat.Mtime)
+	}
+
+	// Bytes match a full sequential read.
+	got := make([]byte, want)
+	if _, err := h.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 16; i++ {
+		dst := got[int64(i)*int64(len(chunk)) : int64(i+1)*int64(len(chunk))]
+		if !bytes.Equal(dst, chunk) {
+			t.Fatalf("chunk %d mismatched", i)
+		}
+	}
+}
+
+// TestBulkWriterLandsInTargetTier confirms bytes go where requested,
+// not the default tier.
+func TestBulkWriterLandsInTargetTier(t *testing.T) {
+	s := newStore(t)
+	n, h, err := s.Create(RootInode, "tiered.bin", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	bw := h.NewBulkWriter(TierCold)
+	if err := bw.Write(0, bytes.Repeat([]byte("X"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	hotBytes := int64(0)
+	coldBytes := int64(0)
+	s.Index().IterStripes(func(si index.StripeInfo) bool {
+		if si.Inode != n.Inode {
+			return true
+		}
+		hotBytes += si.HotBytes
+		coldBytes += si.ColdBytes
+		return true
+	})
+	if hotBytes != 0 {
+		t.Errorf("hot bytes %d, want 0 (BulkWriter targeted cold)", hotBytes)
+	}
+	if coldBytes == 0 {
+		t.Errorf("cold bytes 0, want > 0")
 	}
 }
 

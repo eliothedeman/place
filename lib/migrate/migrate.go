@@ -46,7 +46,10 @@ import (
 )
 
 const (
-	chunkSize          = 4 << 20
+	// chunkSize is the per-read/per-write byte size during copyFile. Larger
+	// means fewer iterations + smaller per-fragment overhead in bbolt; we
+	// pick 16 MiB as a reasonable balance against migrator RSS.
+	chunkSize          = 16 << 20
 	progressInterval   = 10 * time.Second
 	legacyDirName      = ".place"
 	legacySegmentsName = "segments"
@@ -420,7 +423,7 @@ func (m *migrator) handle(fm *oldplace.FileMeta, newParent uint64) error {
 		if err != nil {
 			return fmt.Errorf("Create(%q): %w", fm.Rel, err)
 		}
-		n, copyErr := m.copyFile(h, fm)
+		n, copyErr := m.copyFileBulk(h, fm)
 		closeErr := h.Close()
 		if copyErr != nil {
 			return fmt.Errorf("copy(%q): %w", fm.Rel, copyErr)
@@ -447,12 +450,21 @@ func (m *migrator) handle(fm *oldplace.FileMeta, newParent uint64) error {
 	}
 }
 
-// copyFile streams bytes from the old reader into the new handle, in
-// chunkSize pieces, landing them in targetTier. Returns bytes written.
-func (m *migrator) copyFile(h *store.Handle, fm *oldplace.FileMeta) (int64, error) {
+// copyFileBulk streams bytes from the old reader into the new handle via
+// the bulk-writer path: every chunk-sized piece goes to the target tier's
+// active segment without a per-chunk fsync, and one Commit at the end
+// fsyncs the touched segments and commits all fragments in a single bbolt
+// tx. For multi-GB files this is the difference between hours and minutes
+// — the regular WriteAt path issues three fsyncs per chunk.
+//
+// On a partial-copy failure the bulk writer is Abort'd, leaving orphan
+// segment bytes that GC reclaims on the next pass. The legacy file is not
+// marked migrated, so a future Run redoes it.
+func (m *migrator) copyFileBulk(h *store.Handle, fm *oldplace.FileMeta) (int64, error) {
 	if fm.Size == 0 {
 		return 0, nil
 	}
+	bw := h.NewBulkWriter(targetTier)
 	buf := make([]byte, chunkSize)
 	var total int64
 	for off := int64(0); off < fm.Size; {
@@ -462,12 +474,14 @@ func (m *migrator) copyFile(h *store.Handle, fm *oldplace.FileMeta) (int64, erro
 		}
 		rn, err := m.reader.ReadAt(fm.Rel, buf[:n], off)
 		if err != nil && err != io.EOF {
+			bw.Abort()
 			return total, err
 		}
 		if rn == 0 {
 			break
 		}
-		if _, werr := h.WriteAtTier(buf[:rn], off, targetTier); werr != nil {
+		if werr := bw.Write(off, buf[:rn]); werr != nil {
+			bw.Abort()
 			return total, werr
 		}
 		off += int64(rn)
@@ -478,7 +492,10 @@ func (m *migrator) copyFile(h *store.Handle, fm *oldplace.FileMeta) (int64, erro
 			break
 		}
 	}
-	return total, h.Sync()
+	if err := bw.Commit(); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 func (m *migrator) recordInode(oldInode, newInode uint64) error {

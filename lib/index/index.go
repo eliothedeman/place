@@ -378,6 +378,152 @@ func (idx *Index) ReadAt(loc Locator, p []byte) (int, error) {
 	return seg.ReadAt(p, loc.Offset)
 }
 
+// BulkSession is a write session that batches segment fsyncs and bbolt
+// commits across many Write calls into a single Commit. Use it for
+// bulk-ingest paths (migration, restore-from-backup, etc.) where the
+// per-chunk durability the regular Append path provides is overkill —
+// a crash mid-session loses the in-flight bytes as orphans (reclaimable
+// by GC) and the caller redoes the work, rather than serialising every
+// chunk through fsync.
+//
+// Lifecycle:
+//   sess := idx.NewBulkSession(inode, tier)
+//   sess.Write(off1, payload1)
+//   sess.Write(off2, payload2)
+//   ...
+//   if err := sess.Commit(); err != nil { ... }
+//
+// Commit fsyncs every segment the session touched, then commits all
+// queued fragments to bbolt in one tx. After Commit returns, the bytes
+// are durable and the index sees them.
+type BulkSession struct {
+	idx     *Index
+	inode   uint64
+	tier    Tier
+	pending []pendingFrag
+	touched map[uint32]*segment.Segment
+}
+
+type pendingFrag struct {
+	stripeID      uint32
+	logicalOff    int64
+	length        int64
+	segmentID     uint32
+	segmentOffset int64
+}
+
+// NewBulkSession returns a fresh session writing to tier for inode.
+// Multiple sessions on the same inode aren't supported and aren't checked
+// for — bulk paths are single-writer per file.
+func (idx *Index) NewBulkSession(inode uint64, tier Tier) *BulkSession {
+	return &BulkSession{
+		idx:     idx,
+		inode:   inode,
+		tier:    tier,
+		touched: map[uint32]*segment.Segment{},
+	}
+}
+
+// Write appends payload at logicalOff. Splits across stripe boundaries
+// like Append, but each piece is written to the segment file with no
+// fsync; durability is deferred to Commit. The bytes are not visible to
+// readers until Commit returns successfully.
+func (s *BulkSession) Write(logicalOff int64, payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	rem := payload
+	off := logicalOff
+	for len(rem) > 0 {
+		stripeID := s.idx.stripeOf(off)
+		stripeEnd := (int64(stripeID) + 1) * s.idx.stripeSize
+		chunkLen := int64(len(rem))
+		if off+chunkLen > stripeEnd {
+			chunkLen = stripeEnd - off
+		}
+		set := s.idx.setFor(s.tier)
+		seg, err := set.Active(segment.FramedSize(int(chunkLen)))
+		if err != nil {
+			return err
+		}
+		// Seq=0 in the on-disk record header. The bbolt-side Seq is
+		// assigned at Commit time. The on-disk Seq is only consulted by
+		// the catastrophic-recovery rebuild path, which we'll address
+		// separately if it ever matters; index reads always use bbolt.
+		payloadOff, err := seg.Append(segment.RecordHeader{
+			Inode: s.inode, StripeID: stripeID, Seq: 0,
+			LogicalOff: off, Length: uint32(chunkLen),
+		}, rem[:chunkLen])
+		if err != nil {
+			return err
+		}
+		s.touched[seg.ID()] = seg
+		s.pending = append(s.pending, pendingFrag{
+			stripeID:      stripeID,
+			logicalOff:    off,
+			length:        chunkLen,
+			segmentID:     seg.ID(),
+			segmentOffset: payloadOff,
+		})
+		rem = rem[chunkLen:]
+		off += chunkLen
+	}
+	return nil
+}
+
+// Commit fsyncs every touched segment, then commits all queued fragments
+// to bbolt in a single write tx. After return, the index sees the bytes.
+func (s *BulkSession) Commit() error {
+	s.idx.writeMu.Lock()
+	defer s.idx.writeMu.Unlock()
+
+	for _, seg := range s.touched {
+		if err := seg.Sync(); err != nil {
+			return err
+		}
+	}
+	return s.idx.db.Update(func(tx *bolt.Tx) error {
+		sb := tx.Bucket(bucketStripes)
+		// Group pending fragments by stripe.
+		byStripe := map[uint32][]pendingFrag{}
+		for _, pf := range s.pending {
+			byStripe[pf.stripeID] = append(byStripe[pf.stripeID], pf)
+		}
+		for stripeID, frags := range byStripe {
+			key := stripeKey(s.inode, stripeID)
+			existing := decodeFragments(sb.Get(key))
+			var maxSeq uint64
+			for _, f := range existing {
+				if f.Seq > maxSeq {
+					maxSeq = f.Seq
+				}
+			}
+			for _, pf := range frags {
+				maxSeq++
+				existing = append(existing, Fragment{
+					Seq:           maxSeq,
+					LogicalOff:    pf.logicalOff,
+					Length:        pf.length,
+					Tier:          s.tier,
+					SegmentID:     pf.segmentID,
+					SegmentOffset: pf.segmentOffset,
+				})
+			}
+			if err := sb.Put(key, encodeFragments(existing)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Abort discards the session. The bytes already written to segments
+// remain as orphan records; GC reclaims them on the next pass.
+func (s *BulkSession) Abort() {
+	s.pending = nil
+	s.touched = nil
+}
+
 // Truncate drops any fragment data past `size` for inode. Stripes wholly
 // past `size` are removed; the stripe containing the truncate point has its
 // fragments clipped or removed. Data in segments still on disk remains until
