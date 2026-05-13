@@ -1,11 +1,9 @@
 #!/bin/sh
 set -eu
 
-# placefs picks up the legacy --hot/--cold/--mount paths verbatim. If the
-# bound /mnt/hot still contains old-format data (.place.db + .place/segments)
-# from a previous deploy of the legacy `place mount` binary, placefs runs
-# the in-place migrator on first start before mounting — no separate step
-# is required.
+# Hot/cold/mount paths are fixed by the volume layout in docker-compose.yml.
+# Extra placefs flags (--hot-max-bytes, --tick, --admin-addr, etc.) can
+# be appended via `command:` in compose; they land in "$@".
 exec /usr/local/bin/placefs \
     --hot=/mnt/hot \
     --cold=/mnt/cold \

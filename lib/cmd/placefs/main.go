@@ -1,11 +1,5 @@
 // Command placefs wires the L1–L5 layered stack and mounts it as a FUSE
-// filesystem. It uses the same -hot / -cold directory flags as the legacy
-// binary so upgrading is a drop-in: rerun the new binary with the same
-// paths and migrate.Run() handles any legacy data found in those dirs.
-//
-// New on-disk state lives under {hot}/.placefs and {cold}/.placefs, which
-// never collides with the legacy ".place/" subtree. The migrator removes
-// the legacy subtree itself once everything has been copied over.
+// filesystem. On-disk state lives under {hot}/.placefs and {cold}/.placefs.
 package main
 
 import (
@@ -21,7 +15,6 @@ import (
 	"github.com/eliothedeman/place/lib/admin"
 	"github.com/eliothedeman/place/lib/fuselayer"
 	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/migrate"
 	"github.com/eliothedeman/place/lib/mover"
 	"github.com/eliothedeman/place/lib/store"
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -71,20 +64,6 @@ func main() {
 		log.Fatalf("store open: %v", err)
 	}
 	log.Printf("placefs: store open")
-
-	// Migration is unconditional — it self-detects "nothing to do" and
-	// short-circuits. It runs before mount so partial state is never
-	// user-visible.
-	stats, err := migrate.Run(st)
-	if err != nil {
-		st.Close()
-		log.Fatalf("migrate: %v", err)
-	}
-	if stats.Files+stats.Dirs+stats.Symlinks+stats.Hardlinks+stats.LegacyOrphans+stats.SegmentsReaped > 0 {
-		log.Printf("placefs: migration done — %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes, %d orphan legacy segs, %d reaped legacy segs",
-			stats.Files, stats.Dirs, stats.Symlinks, stats.Hardlinks,
-			stats.Bytes, stats.LegacyOrphans, stats.SegmentsReaped)
-	}
 
 	mv := mover.Start(mover.Config{
 		Index:          idx,

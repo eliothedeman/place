@@ -53,19 +53,6 @@ services:
     # Extra placefs flags go here. Hot/cold/mount paths are wired up by
     # docker-entrypoint.sh, so do NOT pass --hot/--cold/--mount.
     #
-    # If you're upgrading from the legacy `place mount` binary, your existing
-    # /mnt/hot and /mnt/cold volumes still hold the old .place.db /
-    # .place/segments data; placefs auto-detects that on first start and
-    # migrates everything into the new .placefs/ layout in-place. The legacy
-    # files stay on disk until you remove them manually.
-    #
-    # Flag name changes from the legacy binary:
-    #   --evict-at / --evict-to / --replicate-after / --replicate-max-bytes
-    #       → no direct equivalents; use --hot-max-bytes / --hot-target-bytes
-    #         to bound hot tier byte usage (eviction triggers when exceeded).
-    #   --debug / --fuse-debug / --pprof-addr      → not present; add back
-    #         to lib/cmd/placefs if you need them.
-    #
     # command:
     #   - --hot-max-bytes=2147483648     # 2 GiB cap on hot tier
     #   - --hot-target-bytes=1610612736  # 1.5 GiB post-evict target
