@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eliothedeman/place/lib/fuselayer"
 	"github.com/eliothedeman/place/lib/index"
 	"github.com/eliothedeman/place/lib/mover"
 )
@@ -84,7 +85,7 @@ func TestHealthzReadinessFlow(t *testing.T) {
 
 func TestHealthzFailsIfMoverStale(t *testing.T) {
 	idx := newIndex(t)
-	mv := mover.Start(mover.Config{Index: idx, Tick: time.Hour, Logger: func(string, ...any) {}})
+	mv := mover.Start(mover.Config{Index: idx, Tick: time.Hour})
 	defer mv.Stop()
 
 	addr := freePort(t)
@@ -115,7 +116,7 @@ func TestHealthzFailsIfMoverStale(t *testing.T) {
 
 func TestMetricsExposition(t *testing.T) {
 	idx := newIndex(t)
-	mv := mover.Start(mover.Config{Index: idx, Tick: time.Hour, Logger: func(string, ...any) {}})
+	mv := mover.Start(mover.Config{Index: idx, Tick: time.Hour})
 	defer mv.Stop()
 
 	addr := freePort(t)
@@ -143,6 +144,12 @@ func TestMetricsExposition(t *testing.T) {
 		`placefs_segment_count{tier="cold"}`,
 		"placefs_mover_evict_runs_total",
 		"placefs_mover_moves_ok_total",
+		"placefs_mover_move_duration_seconds_total",
+		"placefs_mover_gc_duration_seconds_total",
+		"placefs_bbolt_db_size_bytes",
+		"placefs_bbolt_open_tx",
+		`placefs_disk_total_bytes{tier="hot"}`,
+		`placefs_disk_avail_bytes{tier="hot"}`,
 		"# TYPE placefs_segment_count gauge",
 	}
 	for _, w := range wantHints {
@@ -154,5 +161,75 @@ func TestMetricsExposition(t *testing.T) {
 	// Sanity: HELP/TYPE lines aren't doubled-up for the labelled metric.
 	if strings.Count(body, "# TYPE placefs_segment_count") != 1 {
 		t.Errorf("expected exactly one TYPE line for placefs_segment_count, got:\n%s", body)
+	}
+}
+
+func TestMetricsIncludesFuseOpsWhenProvided(t *testing.T) {
+	idx := newIndex(t)
+	fm := fuselayer.NewMetrics()
+	stampOps(fm)
+
+	addr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readinessFlag.Store(true)
+	_, err := Serve(ctx, addr, Deps{
+		Index:     idx,
+		Fuse:      fm,
+		StartTime: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitServerUp(t, "http://"+addr+"/healthz")
+	code, body := get(t, "http://"+addr+"/metrics")
+	if code != http.StatusOK {
+		t.Fatalf("/metrics code=%d", code)
+	}
+	for _, w := range []string{
+		`placefs_fuse_op_calls_total{op="read"}`,
+		`placefs_fuse_op_errors_total{op="read"}`,
+		`placefs_fuse_op_duration_seconds_total{op="read"}`,
+		`placefs_fuse_op_calls_total{op="write"}`,
+	} {
+		if !strings.Contains(body, w) {
+			t.Errorf("metrics body missing %q\n--- body ---\n%s", w, body)
+		}
+	}
+}
+
+func TestPprofGatedByFlag(t *testing.T) {
+	idx := newIndex(t)
+	addr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readinessFlag.Store(true)
+	_, err := Serve(ctx, addr, Deps{
+		Index:       idx,
+		StartTime:   time.Now(),
+		EnablePprof: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitServerUp(t, "http://"+addr+"/healthz")
+
+	code, _ := get(t, "http://"+addr+"/debug/pprof/cmdline")
+	if code != http.StatusOK {
+		t.Errorf("pprof/cmdline code=%d, want 200", code)
+	}
+
+	// Same setup without the flag must 404.
+	addr2 := freePort(t)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	_, err = Serve(ctx2, addr2, Deps{Index: idx, StartTime: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitServerUp(t, "http://"+addr2+"/healthz")
+	code, _ = get(t, "http://"+addr2+"/debug/pprof/cmdline")
+	if code == http.StatusOK {
+		t.Errorf("pprof exposed without flag: code=%d, want 404", code)
 	}
 }

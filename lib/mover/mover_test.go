@@ -33,7 +33,6 @@ func TestEvictMovesHotStripesToCold(t *testing.T) {
 		HotMaxBytes:    1,
 		HotTargetBytes: 0,
 		Tick:           1 << 30, // huge — we'll trigger manually
-		Logger:         func(string, ...any) {},
 	})
 	defer mv.Stop()
 	if err := mv.RunOnce(); err != nil {
@@ -91,7 +90,7 @@ func TestGCSkipsActiveSegment(t *testing.T) {
 		t.Fatalf("no hot segments after one append")
 	}
 
-	mv := Start(Config{Index: idx, Logger: func(string, ...any) {}})
+	mv := Start(Config{Index: idx})
 	defer mv.Stop()
 	if err := mv.RunOnce(); err != nil {
 		t.Fatal(err)

@@ -6,9 +6,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,16 +37,28 @@ func main() {
 	adminAddr := flag.String("admin-addr", ":9090", `host:port for /metrics + /healthz (empty disables the admin server)`)
 	healthMaxGap := flag.Duration("health-max-tick-gap", 5*time.Minute, "max gap since last mover tick before /healthz reports unhealthy (0 disables the check)")
 	shutdownGrace := flag.Duration("shutdown-grace", 30*time.Second, "max time to wait for FUSE unmount + mover stop on SIGTERM")
+	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+	logFormat := flag.String("log-format", "text", "log format: text|json")
+	debugPprof := flag.Bool("debug-pprof", false, "expose /debug/pprof on the admin server (off by default)")
+	slowOpThreshold := flag.Duration("slow-op-threshold", 1*time.Second, "FUSE operations slower than this log at debug level (0 disables)")
 	flag.Parse()
+
+	logger, err := makeLogger(*logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	slog.SetDefault(logger)
 
 	if *hot == "" || *cold == "" || *mountPoint == "" {
 		fmt.Fprintln(os.Stderr, "all of -hot, -cold, -mount are required")
 		os.Exit(2)
 	}
-	log.Printf("placefs: starting (hot=%s cold=%s mount=%s)", *hot, *cold, *mountPoint)
+	logger.Info("starting", "hot", *hot, "cold", *cold, "mount", *mountPoint)
 	for _, p := range []string{*hot, *cold, *mountPoint} {
 		if err := os.MkdirAll(p, 0o700); err != nil {
-			log.Fatalf("mkdir %s: %v", p, err)
+			logger.Error("mkdir failed", "path", p, "err", err)
+			os.Exit(1)
 		}
 	}
 
@@ -55,21 +70,26 @@ func main() {
 		SegmentMaxSize: *segMax,
 	})
 	if err != nil {
-		log.Fatalf("index open: %v", err)
+		logger.Error("index open failed", "err", err)
+		os.Exit(1)
 	}
-	log.Printf("placefs: index open (stripe=%d segment-max=%d)", *stripeSize, *segMax)
+	logger.Info("index open", "stripe", *stripeSize, "segment_max", *segMax)
 	st, err := store.Open(idx)
 	if err != nil {
 		idx.Close()
-		log.Fatalf("store open: %v", err)
+		logger.Error("store open failed", "err", err)
+		os.Exit(1)
 	}
-	log.Printf("placefs: store open")
+	logger.Info("store open")
+
+	fuseMetrics := fuselayer.NewMetrics()
 
 	mv := mover.Start(mover.Config{
 		Index:          idx,
 		HotMaxBytes:    *hotMax,
 		HotTargetBytes: *hotTarget,
 		Tick:           *tick,
+		Logger:         logger,
 	})
 
 	startTime := time.Now()
@@ -79,14 +99,25 @@ func main() {
 		if _, err := admin.Serve(adminCtx, *adminAddr, admin.Deps{
 			Index:            idx,
 			Mover:            mv,
+			Fuse:             fuseMetrics,
 			HealthMaxTickGap: *healthMaxGap,
 			StartTime:        startTime,
+			Logger:           logger,
+			EnablePprof:      *debugPprof,
 		}); err != nil {
 			mv.Stop()
 			st.Close()
-			log.Fatalf("admin server: %v", err)
+			logger.Error("admin server failed", "err", err)
+			os.Exit(1)
 		}
-		log.Printf("placefs: admin server on %s (/healthz /metrics)", *adminAddr)
+		logger.Info("admin server listening", "addr", *adminAddr, "pprof", *debugPprof)
+	} else if *debugPprof {
+		// pprof without admin server: stand-alone listener on :6060.
+		go func() {
+			if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+				logger.Error("pprof listener failed", "err", err)
+			}
+		}()
 	}
 
 	opts := &fs.Options{
@@ -95,21 +126,27 @@ func main() {
 			FsName: "placefs",
 		},
 	}
-	server, err := fs.Mount(*mountPoint, fuselayer.NewRoot(st), opts)
+	root := fuselayer.NewRoot(st, fuselayer.Options{
+		Metrics:         fuseMetrics,
+		Logger:          logger,
+		SlowOpThreshold: *slowOpThreshold,
+	})
+	server, err := fs.Mount(*mountPoint, root, opts)
 	if err != nil {
 		cancelAdmin()
 		mv.Stop()
 		st.Close()
-		log.Fatalf("mount: %v", err)
+		logger.Error("mount failed", "err", err)
+		os.Exit(1)
 	}
-	log.Printf("placefs mounted at %s (hot=%s cold=%s)", *mountPoint, *hot, *cold)
+	logger.Info("mounted", "mount", *mountPoint, "hot", *hot, "cold", *cold)
 	admin.MarkReady()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigs
-		log.Printf("placefs: %s received, unmounting (grace=%s)", sig, *shutdownGrace)
+		logger.Info("signal received, unmounting", "signal", sig.String(), "grace", *shutdownGrace)
 		done := make(chan struct{})
 		go func() {
 			server.Unmount()
@@ -118,7 +155,7 @@ func main() {
 		select {
 		case <-done:
 		case <-time.After(*shutdownGrace):
-			log.Printf("placefs: shutdown grace exceeded; forcing exit")
+			logger.Error("shutdown grace exceeded; forcing exit")
 			os.Exit(1)
 		}
 	}()
@@ -126,6 +163,33 @@ func main() {
 	cancelAdmin()
 	mv.Stop()
 	if err := st.Close(); err != nil {
-		log.Printf("close: %v", err)
+		logger.Error("close failed", "err", err)
 	}
+}
+
+func makeLogger(level, format string) (*slog.Logger, error) {
+	var lv slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lv = slog.LevelDebug
+	case "info":
+		lv = slog.LevelInfo
+	case "warn", "warning":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	default:
+		return nil, fmt.Errorf("invalid -log-level %q (want debug|info|warn|error)", level)
+	}
+	opts := &slog.HandlerOptions{Level: lv}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "text", "":
+		h = slog.NewTextHandler(os.Stderr, opts)
+	case "json":
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	default:
+		return nil, fmt.Errorf("invalid -log-format %q (want text|json)", format)
+	}
+	return slog.New(h), nil
 }

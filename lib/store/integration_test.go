@@ -83,7 +83,6 @@ func TestEvictUnderPressureKeepsDataReadable(t *testing.T) {
 		HotMaxBytes:    1,
 		HotTargetBytes: 0,
 		Tick:           1 << 30,
-		Logger:         func(string, ...any) {},
 	})
 	defer mv.Stop()
 	for i := 0; i < 3; i++ {

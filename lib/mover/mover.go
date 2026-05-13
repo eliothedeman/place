@@ -17,7 +17,8 @@ package mover
 
 import (
 	"context"
-	"log"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,9 +45,10 @@ type Config struct {
 	// errors doubles the sleep up to this cap; a clean tick resets it.
 	MaxBackoff time.Duration
 
-	// Logger is optional; defaults to log.Printf-with-prefix. Use a no-op
-	// for quiet tests.
-	Logger func(format string, args ...any)
+	// Logger is the structured logger. Nil disables mover logging entirely
+	// (useful in tests). All mover lines carry a "component=mover" attr,
+	// added automatically.
+	Logger *slog.Logger
 }
 
 // Mover is the running background engine. Call Stop to shut it down.
@@ -54,19 +56,21 @@ type Mover struct {
 	cfg    Config
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	log    func(format string, args ...any)
+	log    *slog.Logger
 
 	// metrics — read with the matching accessor methods so callers don't
 	// have to know the layout. Atomic so they're safe to read off-thread
 	// from a /metrics handler.
-	evictRuns     atomic.Int64
-	gcRuns        atomic.Int64
-	movesOK       atomic.Int64
-	moveFailures  atomic.Int64
-	bytesMoved    atomic.Int64
-	consecErrs    atomic.Int64
-	lastTickUnix  atomic.Int64
-	lastErrUnix   atomic.Int64
+	evictRuns        atomic.Int64
+	gcRuns           atomic.Int64
+	movesOK          atomic.Int64
+	moveFailures     atomic.Int64
+	bytesMoved       atomic.Int64
+	consecErrs       atomic.Int64
+	lastTickUnix     atomic.Int64
+	lastErrUnix      atomic.Int64
+	moveDurationNanos atomic.Int64
+	gcDurationNanos   atomic.Int64
 }
 
 // Start launches the mover loop. Returns immediately.
@@ -80,14 +84,13 @@ func Start(cfg Config) *Mover {
 	if cfg.HotTargetBytes == 0 && cfg.HotMaxBytes > 0 {
 		cfg.HotTargetBytes = int64(float64(cfg.HotMaxBytes) * 0.8)
 	}
-	logf := cfg.Logger
-	if logf == nil {
-		logf = func(format string, args ...any) {
-			log.Printf("mover: "+format, args...)
-		}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	logger = logger.With("component", "mover")
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Mover{cfg: cfg, cancel: cancel, log: logf}
+	m := &Mover{cfg: cfg, cancel: cancel, log: logger}
 	m.wg.Add(1)
 	go m.loop(ctx)
 	return m
@@ -112,27 +115,31 @@ func (m *Mover) RunOnce() error {
 
 // Stats is a snapshot of mover counters. Cheap; safe to call frequently.
 type Stats struct {
-	EvictRuns        int64
-	GCRuns           int64
-	MovesOK          int64
-	MoveFailures     int64
-	BytesMoved       int64
-	ConsecutiveErrs  int64
-	LastTickUnix     int64 // 0 if the loop has never ticked
-	LastErrorUnix    int64 // 0 if no errors observed yet
+	EvictRuns         int64
+	GCRuns            int64
+	MovesOK           int64
+	MoveFailures      int64
+	BytesMoved        int64
+	ConsecutiveErrs   int64
+	LastTickUnix      int64 // 0 if the loop has never ticked
+	LastErrorUnix     int64 // 0 if no errors observed yet
+	MoveDurationNanos int64 // total wall-time spent inside successful Moves
+	GCDurationNanos   int64 // total wall-time spent inside GC
 }
 
 // Stats returns a snapshot of the mover's lifetime counters.
 func (m *Mover) Stats() Stats {
 	return Stats{
-		EvictRuns:       m.evictRuns.Load(),
-		GCRuns:          m.gcRuns.Load(),
-		MovesOK:         m.movesOK.Load(),
-		MoveFailures:    m.moveFailures.Load(),
-		BytesMoved:      m.bytesMoved.Load(),
-		ConsecutiveErrs: m.consecErrs.Load(),
-		LastTickUnix:    m.lastTickUnix.Load(),
-		LastErrorUnix:   m.lastErrUnix.Load(),
+		EvictRuns:         m.evictRuns.Load(),
+		GCRuns:            m.gcRuns.Load(),
+		MovesOK:           m.movesOK.Load(),
+		MoveFailures:      m.moveFailures.Load(),
+		BytesMoved:        m.bytesMoved.Load(),
+		ConsecutiveErrs:   m.consecErrs.Load(),
+		LastTickUnix:      m.lastTickUnix.Load(),
+		LastErrorUnix:     m.lastErrUnix.Load(),
+		MoveDurationNanos: m.moveDurationNanos.Load(),
+		GCDurationNanos:   m.gcDurationNanos.Load(),
 	}
 }
 
@@ -150,11 +157,11 @@ func (m *Mover) loop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			m.log("evict: %v", err)
+			m.log.Error("evict failed", "err", err)
 			hadErr = true
 		}
 		if err := m.gcOnce(); err != nil {
-			m.log("gc: %v", err)
+			m.log.Error("gc failed", "err", err)
 			hadErr = true
 		}
 		m.lastTickUnix.Store(time.Now().Unix())
@@ -199,7 +206,7 @@ func (m *Mover) evictOnce(ctx context.Context) error {
 	if used <= m.cfg.HotMaxBytes {
 		return nil
 	}
-	m.log("hot pressure: used=%d cap=%d target=%d", used, m.cfg.HotMaxBytes, m.cfg.HotTargetBytes)
+	m.log.Info("hot pressure", "used", used, "cap", m.cfg.HotMaxBytes, "target", m.cfg.HotTargetBytes)
 
 	type cand struct {
 		inode    uint64
@@ -230,14 +237,16 @@ func (m *Mover) evictOnce(ctx context.Context) error {
 		if idx.HotUsedBytes() <= m.cfg.HotTargetBytes {
 			break
 		}
+		start := time.Now()
 		if err := idx.Move(c.inode, c.stripeID, segment.TierCold); err != nil {
 			m.moveFailures.Add(1)
-			m.log("move(inode=%d stripe=%d): %v", c.inode, c.stripeID, err)
+			m.log.Error("move failed", "inode", c.inode, "stripe", c.stripeID, "err", err)
 			continue
 		}
+		m.moveDurationNanos.Add(int64(time.Since(start)))
 		m.movesOK.Add(1)
 		m.bytesMoved.Add(c.hotBytes)
-		m.log("moved inode=%d stripe=%d ~%d bytes", c.inode, c.stripeID, c.hotBytes)
+		m.log.Debug("stripe moved", "inode", c.inode, "stripe", c.stripeID, "bytes", c.hotBytes, "duration", time.Since(start))
 	}
 	return nil
 }
@@ -245,5 +254,8 @@ func (m *Mover) evictOnce(ctx context.Context) error {
 // gcOnce drops segments with zero live references.
 func (m *Mover) gcOnce() error {
 	m.gcRuns.Add(1)
-	return m.cfg.Index.GC()
+	start := time.Now()
+	err := m.cfg.Index.GC()
+	m.gcDurationNanos.Add(int64(time.Since(start)))
+	return err
 }

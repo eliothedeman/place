@@ -2,11 +2,22 @@
 // callbacks to lib/store calls. There should be no business logic here —
 // every method is a one-shot translation. If you find yourself reaching for
 // the index or a segment directly, fix the layering instead.
+//
+// Every FUSE entrypoint is wrapped by trackOp, which:
+//   - increments per-op counters in Metrics (count + error count + total
+//     duration), exposed via /metrics; and
+//   - emits a debug log line if the call took longer than SlowOpThreshold.
+//
+// The wrapping costs one map lookup + two atomic adds per call — negligible
+// next to the bbolt + segment IO it brackets, and pays for itself the first
+// time you need to ask "is the FS slow, and which op is the slow one?"
 package fuselayer
 
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"syscall"
 	"time"
 
@@ -15,19 +26,63 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+// Options configures the FUSE root. Zero value is valid — defaults to no
+// metrics and discard logging.
+type Options struct {
+	// Metrics is optional; if nil, op tracking is disabled.
+	Metrics *Metrics
+	// Logger is optional; if nil, a discard logger is used.
+	Logger *slog.Logger
+	// SlowOpThreshold: ops slower than this log at debug level. 0 disables
+	// the threshold log; counters still apply.
+	SlowOpThreshold time.Duration
+}
+
 // NewRoot constructs the root NodeFS handler for a place filesystem backed
 // by s. Mount with:
 //
-//	server, _ := fs.Mount(mountPoint, fuselayer.NewRoot(s), nil)
-func NewRoot(s *store.Store) fs.InodeEmbedder {
-	return &node{store: s, inode: store.RootInode}
+//	server, _ := fs.Mount(mountPoint, fuselayer.NewRoot(s, fuselayer.Options{}), nil)
+func NewRoot(s *store.Store, opts Options) fs.InodeEmbedder {
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	r := &root{opts: opts}
+	return &node{root: r, store: s, inode: store.RootInode}
+}
+
+// root holds the per-mount shared state. Each node carries a pointer to
+// it so the wrappers and helpers can reach metrics + the logger without
+// taking them as args everywhere.
+type root struct {
+	opts Options
 }
 
 // node is a fs.Inode handler bound to one of the store's inodes.
 type node struct {
 	fs.Inode
+	root  *root
 	store *store.Store
 	inode uint64
+}
+
+// trackOp wraps an op, recording its duration + outcome in metrics, and
+// logging slow ops at debug. Pass a closure that returns the syscall.Errno.
+// The returned Errno is whatever the closure produced — trackOp is a
+// passthrough.
+func (r *root) trackOp(name string, fn func() syscall.Errno) syscall.Errno {
+	if r.opts.Metrics == nil && r.opts.SlowOpThreshold == 0 {
+		return fn()
+	}
+	start := time.Now()
+	e := fn()
+	d := time.Since(start)
+	if r.opts.Metrics != nil {
+		r.opts.Metrics.Observe(name, d, e != 0)
+	}
+	if r.opts.SlowOpThreshold > 0 && d >= r.opts.SlowOpThreshold {
+		r.opts.Logger.Debug("slow fuse op", "op", name, "duration", d, "errno", int(e))
+	}
+	return e
 }
 
 func errno(err error) syscall.Errno {
@@ -72,58 +127,68 @@ func stableAttr(n store.Node) fs.StableAttr {
 var _ fs.NodeLookuper = (*node)(nil)
 
 func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	child, err := n.store.Lookup(n.inode, name)
-	if err != nil {
-		return nil, errno(err)
-	}
-	fillAttr(child, &out.Attr)
-	ino := n.NewInode(ctx, &node{store: n.store, inode: child.Inode}, stableAttr(child))
-	return ino, 0
+	var resInode *fs.Inode
+	var resErrno syscall.Errno
+	n.root.trackOp("lookup", func() syscall.Errno {
+		child, err := n.store.Lookup(n.inode, name)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fillAttr(child, &out.Attr)
+		resInode = n.NewInode(ctx, &node{root: n.root, store: n.store, inode: child.Inode}, stableAttr(child))
+		return 0
+	})
+	return resInode, resErrno
 }
 
 var _ fs.NodeGetattrer = (*node)(nil)
 
 func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	nn, err := n.store.Stat(n.inode)
-	if err != nil {
-		return errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	return 0
+	return n.root.trackOp("getattr", func() syscall.Errno {
+		nn, err := n.store.Stat(n.inode)
+		if err != nil {
+			return errno(err)
+		}
+		fillAttr(nn, &out.Attr)
+		return 0
+	})
 }
 
 var _ fs.NodeSetattrer = (*node)(nil)
 
 func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	var sa store.SetAttr
-	if mode, ok := in.GetMode(); ok {
-		m := store.Mode(mode)
-		sa.Mode = &m
-	}
-	if uid, ok := in.GetUID(); ok {
-		sa.UID = &uid
-	}
-	if gid, ok := in.GetGID(); ok {
-		sa.GID = &gid
-	}
-	if size, ok := in.GetSize(); ok {
-		ss := int64(size)
-		sa.Size = &ss
-	}
-	if mt, ok := in.GetMTime(); ok {
-		nn := mt.UnixNano()
-		sa.Mtime = &nn
-	}
-	if at, ok := in.GetATime(); ok {
-		nn := at.UnixNano()
-		sa.Atime = &nn
-	}
-	nn, err := n.store.Setattr(n.inode, sa)
-	if err != nil {
-		return errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	return 0
+	return n.root.trackOp("setattr", func() syscall.Errno {
+		var sa store.SetAttr
+		if mode, ok := in.GetMode(); ok {
+			m := store.Mode(mode)
+			sa.Mode = &m
+		}
+		if uid, ok := in.GetUID(); ok {
+			sa.UID = &uid
+		}
+		if gid, ok := in.GetGID(); ok {
+			sa.GID = &gid
+		}
+		if size, ok := in.GetSize(); ok {
+			ss := int64(size)
+			sa.Size = &ss
+		}
+		if mt, ok := in.GetMTime(); ok {
+			nn := mt.UnixNano()
+			sa.Mtime = &nn
+		}
+		if at, ok := in.GetATime(); ok {
+			nn := at.UnixNano()
+			sa.Atime = &nn
+		}
+		nn, err := n.store.Setattr(n.inode, sa)
+		if err != nil {
+			return errno(err)
+		}
+		fillAttr(nn, &out.Attr)
+		return 0
+	})
 }
 
 // --- Create / Open / Read / Write / Flush / Fsync / Release ---
@@ -131,74 +196,103 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 var _ fs.NodeCreater = (*node)(nil)
 
 func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	nn, h, err := n.store.Create(n.inode, name, store.Mode(mode))
-	if err != nil {
-		return nil, nil, 0, errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	ino := n.NewInode(ctx, &node{store: n.store, inode: nn.Inode}, stableAttr(nn))
-	return ino, &handle{h: h, store: n.store}, 0, 0
+	var resInode *fs.Inode
+	var resFile fs.FileHandle
+	var resErrno syscall.Errno
+	n.root.trackOp("create", func() syscall.Errno {
+		nn, h, err := n.store.Create(n.inode, name, store.Mode(mode))
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fillAttr(nn, &out.Attr)
+		resInode = n.NewInode(ctx, &node{root: n.root, store: n.store, inode: nn.Inode}, stableAttr(nn))
+		resFile = &handle{h: h, store: n.store, root: n.root}
+		return 0
+	})
+	return resInode, resFile, 0, resErrno
 }
 
 var _ fs.NodeOpener = (*node)(nil)
 
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	h, err := n.store.OpenInode(n.inode, int(flags))
-	if err != nil {
-		return nil, 0, errno(err)
-	}
-	return &handle{h: h, store: n.store}, 0, 0
+	var resFile fs.FileHandle
+	var resErrno syscall.Errno
+	n.root.trackOp("open", func() syscall.Errno {
+		h, err := n.store.OpenInode(n.inode, int(flags))
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		resFile = &handle{h: h, store: n.store, root: n.root}
+		return 0
+	})
+	return resFile, 0, resErrno
 }
 
 // handle is the FUSE FileHandle, delegating to store.Handle.
 type handle struct {
 	h     *store.Handle
 	store *store.Store
+	root  *root
 }
 
 var _ fs.FileReader = (*handle)(nil)
 
 func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	n, err := h.h.ReadAt(dest, off)
-	if err != nil {
-		return nil, errno(err)
-	}
-	return fuse.ReadResultData(dest[:n]), 0
+	var res fuse.ReadResult
+	var resErrno syscall.Errno
+	h.root.trackOp("read", func() syscall.Errno {
+		n, err := h.h.ReadAt(dest, off)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		res = fuse.ReadResultData(dest[:n])
+		return 0
+	})
+	return res, resErrno
 }
 
 var _ fs.FileWriter = (*handle)(nil)
 
 func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
-	n, err := h.h.WriteAt(data, off)
-	if err != nil {
-		return 0, errno(err)
-	}
-	return uint32(n), 0
+	var written uint32
+	var resErrno syscall.Errno
+	h.root.trackOp("write", func() syscall.Errno {
+		n, err := h.h.WriteAt(data, off)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		written = uint32(n)
+		return 0
+	})
+	return written, resErrno
 }
 
 var _ fs.FileFlusher = (*handle)(nil)
 
-// Flush fires on every close(2) — including ones from briefly-opened
-// readers — so it must be cheap. Per-write fsyncs already happened on the
-// WriteAt path; the only outstanding bytes are inside an explicit
-// BulkWriter session, which isn't reachable via the FUSE handle. So Flush
-// is a no-op.
+// Flush fires on every close(2). Per-write fsyncs already happened on the
+// WriteAt path, so this is a no-op.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
 	return 0
 }
 
 var _ fs.FileFsyncer = (*handle)(nil)
 
-// Fsync is an explicit user-requested durability barrier (fsync(2)).
-// Force a sync across all open segments + the bbolt index.
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return errno(h.h.Sync())
+	return h.root.trackOp("fsync", func() syscall.Errno {
+		return errno(h.h.Sync())
+	})
 }
 
 var _ fs.FileReleaser = (*handle)(nil)
 
 func (h *handle) Release(ctx context.Context) syscall.Errno {
-	return errno(h.h.Close())
+	return h.root.trackOp("release", func() syscall.Errno {
+		return errno(h.h.Close())
+	})
 }
 
 // --- Mkdir / Unlink / Rmdir / Rename ---
@@ -206,34 +300,47 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 var _ fs.NodeMkdirer = (*node)(nil)
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	nn, err := n.store.Mkdir(n.inode, name, store.Mode(mode))
-	if err != nil {
-		return nil, errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	return n.NewInode(ctx, &node{store: n.store, inode: nn.Inode}, stableAttr(nn)), 0
+	var resInode *fs.Inode
+	var resErrno syscall.Errno
+	n.root.trackOp("mkdir", func() syscall.Errno {
+		nn, err := n.store.Mkdir(n.inode, name, store.Mode(mode))
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fillAttr(nn, &out.Attr)
+		resInode = n.NewInode(ctx, &node{root: n.root, store: n.store, inode: nn.Inode}, stableAttr(nn))
+		return 0
+	})
+	return resInode, resErrno
 }
 
 var _ fs.NodeUnlinker = (*node)(nil)
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
-	return errno(n.store.Unlink(n.inode, name))
+	return n.root.trackOp("unlink", func() syscall.Errno {
+		return errno(n.store.Unlink(n.inode, name))
+	})
 }
 
 var _ fs.NodeRmdirer = (*node)(nil)
 
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
-	return errno(n.store.Rmdir(n.inode, name))
+	return n.root.trackOp("rmdir", func() syscall.Errno {
+		return errno(n.store.Rmdir(n.inode, name))
+	})
 }
 
 var _ fs.NodeRenamer = (*node)(nil)
 
 func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	np, ok := newParent.(*node)
-	if !ok {
-		return syscall.EINVAL
-	}
-	return errno(n.store.Rename(n.inode, name, np.inode, newName))
+	return n.root.trackOp("rename", func() syscall.Errno {
+		np, ok := newParent.(*node)
+		if !ok {
+			return syscall.EINVAL
+		}
+		return errno(n.store.Rename(n.inode, name, np.inode, newName))
+	})
 }
 
 // --- Symlink / Readlink / Link ---
@@ -241,37 +348,59 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 var _ fs.NodeSymlinker = (*node)(nil)
 
 func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	nn, err := n.store.Symlink(n.inode, name, target)
-	if err != nil {
-		return nil, errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	return n.NewInode(ctx, &node{store: n.store, inode: nn.Inode}, stableAttr(nn)), 0
+	var resInode *fs.Inode
+	var resErrno syscall.Errno
+	n.root.trackOp("symlink", func() syscall.Errno {
+		nn, err := n.store.Symlink(n.inode, name, target)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fillAttr(nn, &out.Attr)
+		resInode = n.NewInode(ctx, &node{root: n.root, store: n.store, inode: nn.Inode}, stableAttr(nn))
+		return 0
+	})
+	return resInode, resErrno
 }
 
 var _ fs.NodeReadlinker = (*node)(nil)
 
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	t, err := n.store.Readlink(n.inode)
-	if err != nil {
-		return nil, errno(err)
-	}
-	return []byte(t), 0
+	var res []byte
+	var resErrno syscall.Errno
+	n.root.trackOp("readlink", func() syscall.Errno {
+		t, err := n.store.Readlink(n.inode)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		res = []byte(t)
+		return 0
+	})
+	return res, resErrno
 }
 
 var _ fs.NodeLinker = (*node)(nil)
 
 func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	tgt, ok := target.(*node)
-	if !ok {
-		return nil, syscall.EINVAL
-	}
-	nn, err := n.store.Link(tgt.inode, n.inode, name)
-	if err != nil {
-		return nil, errno(err)
-	}
-	fillAttr(nn, &out.Attr)
-	return n.NewInode(ctx, &node{store: n.store, inode: nn.Inode}, stableAttr(nn)), 0
+	var resInode *fs.Inode
+	var resErrno syscall.Errno
+	n.root.trackOp("link", func() syscall.Errno {
+		tgt, ok := target.(*node)
+		if !ok {
+			resErrno = syscall.EINVAL
+			return resErrno
+		}
+		nn, err := n.store.Link(tgt.inode, n.inode, name)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fillAttr(nn, &out.Attr)
+		resInode = n.NewInode(ctx, &node{root: n.root, store: n.store, inode: nn.Inode}, stableAttr(nn))
+		return 0
+	})
+	return resInode, resErrno
 }
 
 // --- Readdir / Statfs ---
@@ -279,35 +408,41 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 var _ fs.NodeReaddirer = (*node)(nil)
 
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	entries, err := n.store.Readdir(n.inode)
-	if err != nil {
-		return nil, errno(err)
-	}
-	fuseEnt := make([]fuse.DirEntry, 0, len(entries))
-	for _, e := range entries {
-		fuseEnt = append(fuseEnt, fuse.DirEntry{
-			Name: e.Name,
-			Ino:  e.Inode,
-			Mode: uint32(e.Mode) & uint32(store.ModeMask),
-		})
-	}
-	return fs.NewListDirStream(fuseEnt), 0
+	var resStream fs.DirStream
+	var resErrno syscall.Errno
+	n.root.trackOp("readdir", func() syscall.Errno {
+		entries, err := n.store.Readdir(n.inode)
+		if err != nil {
+			resErrno = errno(err)
+			return resErrno
+		}
+		fuseEnt := make([]fuse.DirEntry, 0, len(entries))
+		for _, e := range entries {
+			fuseEnt = append(fuseEnt, fuse.DirEntry{
+				Name: e.Name,
+				Ino:  e.Inode,
+				Mode: uint32(e.Mode) & uint32(store.ModeMask),
+			})
+		}
+		resStream = fs.NewListDirStream(fuseEnt)
+		return 0
+	})
+	return resStream, resErrno
 }
 
 var _ fs.NodeStatfser = (*node)(nil)
 
 func (n *node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
-	st, err := n.store.Statfs()
-	if err != nil {
-		return errno(err)
-	}
-	out.Bsize = st.BlockSize
-	out.Blocks = st.Blocks
-	out.Bfree = st.BlocksFree
-	out.Bavail = st.BlocksAvail
-	out.NameLen = 255
-	return 0
+	return n.root.trackOp("statfs", func() syscall.Errno {
+		st, err := n.store.Statfs()
+		if err != nil {
+			return errno(err)
+		}
+		out.Bsize = st.BlockSize
+		out.Blocks = st.Blocks
+		out.Bfree = st.BlocksFree
+		out.Bavail = st.BlocksAvail
+		out.NameLen = 255
+		return 0
+	})
 }
-
-// Avoid unused-import lint when build tags strip something.
-var _ = time.Now
