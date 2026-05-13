@@ -67,6 +67,7 @@ type Stats struct {
 	Symlinks       int
 	Hardlinks      int
 	Bytes          int64
+	Failures       int // files whose copy raised an error; they're left in legacy state for a future Run
 	LegacyOrphans  int // legacy .seg files deleted because no FileMeta referenced them
 	SegmentsReaped int // legacy .seg files deleted incrementally because their last referencer migrated
 }
@@ -200,6 +201,17 @@ func runLegacy(st *store.Store, hot, cold, dbPath string) (Stats, error) {
 
 	// Migration completed. Release old handles before deleting the files.
 	m.closeOldHandles(hotSet, coldSet)
+
+	// If any file failed to copy, leave the legacy subtree intact so the
+	// operator can investigate and re-run. The manifest stays too so the
+	// successful files aren't re-migrated. Failed files have already been
+	// rolled out of the new store, so a future Run will re-attempt them.
+	if m.stats.Failures > 0 {
+		log.Printf("migrate: %d file(s) failed to copy; leaving legacy subtree at %s for retry",
+			m.stats.Failures, dbPath)
+		m.emitProgress("done-with-failures")
+		return m.stats, nil
+	}
 
 	if err := m.removeLegacyTree(dbPath); err != nil {
 		return m.stats, fmt.Errorf("migrate: remove legacy tree: %w", err)
@@ -425,11 +437,22 @@ func (m *migrator) handle(fm *oldplace.FileMeta, newParent uint64) error {
 		}
 		n, copyErr := m.copyFileBulk(h, fm)
 		closeErr := h.Close()
-		if copyErr != nil {
-			return fmt.Errorf("copy(%q): %w", fm.Rel, copyErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close(%q): %w", fm.Rel, closeErr)
+		if copyErr != nil || closeErr != nil {
+			// Roll back: drop the empty/partial new-store entry so resume
+			// logic on a future Run sees the path as missing and retries
+			// (instead of treating an empty file as "already migrated").
+			// We don't dec-ref the legacy segments — they remain on disk
+			// referencing this file, ready for the next attempt.
+			if uErr := m.st.Unlink(newParent, name); uErr != nil {
+				log.Printf("migrate: rollback unlink %q failed: %v (manual cleanup required)", fm.Rel, uErr)
+			}
+			err := copyErr
+			if err == nil {
+				err = closeErr
+			}
+			log.Printf("migrate: skipping %q (left in legacy state for retry): %v", fm.Rel, err)
+			m.stats.Failures++
+			return nil
 		}
 		if err := m.recordInode(fm.InodeID, newN.Inode); err != nil {
 			return err
@@ -457,9 +480,19 @@ func (m *migrator) handle(fm *oldplace.FileMeta, newParent uint64) error {
 // tx. For multi-GB files this is the difference between hours and minutes
 // — the regular WriteAt path issues three fsyncs per chunk.
 //
-// On a partial-copy failure the bulk writer is Abort'd, leaving orphan
-// segment bytes that GC reclaims on the next pass. The legacy file is not
-// marked migrated, so a future Run redoes it.
+// Error handling: every error path Aborts the bulk writer so the orphan
+// segment bytes get reclaimed by GC. We do NOT commit a partial copy,
+// because a short file in the new store would be indistinguishable from
+// a complete one to resume logic and would silently lose data. Possible
+// outcomes:
+//
+//   - Clean EOF or full read → bytes==fm.Size, Commit, return (n, nil).
+//   - Partial read with non-EOF error (e.g. a corrupt source segment) →
+//     Abort, return (read-bytes, err). Caller rolls back the new-store
+//     entry so a future Run retries.
+//   - Short read with no error (contract violation, but defend) → Abort,
+//     return (read-bytes, "short read").
+//   - Bulk-write or Commit failure → Abort, return (read-bytes, err).
 func (m *migrator) copyFileBulk(h *store.Handle, fm *oldplace.FileMeta) (int64, error) {
 	if fm.Size == 0 {
 		return 0, nil
@@ -473,27 +506,45 @@ func (m *migrator) copyFileBulk(h *store.Handle, fm *oldplace.FileMeta) (int64, 
 			n = fm.Size - off
 		}
 		rn, err := m.reader.ReadAt(fm.Rel, buf[:n], off)
-		if err != nil && err != io.EOF {
+		// Queue whatever bytes we got. We commit the BulkWriter only if
+		// the whole file lands cleanly; otherwise Abort drops the in-
+		// flight bytes as GC fodder.
+		if rn > 0 {
+			if werr := bw.Write(off, buf[:rn]); werr != nil {
+				bw.Abort()
+				return total, fmt.Errorf("bulk write at %d: %w", off, werr)
+			}
+			off += int64(rn)
+			total += int64(rn)
+			m.maybeProgress()
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			// Non-EOF error: source unreadable for some byte range.
 			bw.Abort()
-			return total, err
+			return total, fmt.Errorf("read at %d: %w", off, err)
 		}
 		if rn == 0 {
-			break
-		}
-		if werr := bw.Write(off, buf[:rn]); werr != nil {
+			// Reader returned (0, nil) — should not happen per its
+			// contract, but defend so we don't spin forever.
 			bw.Abort()
-			return total, werr
-		}
-		off += int64(rn)
-		total += int64(rn)
-		// Mid-file progress for multi-GB files: we'd otherwise look stuck.
-		m.maybeProgress()
-		if err == io.EOF {
-			break
+			return total, fmt.Errorf("reader returned 0 bytes with no error at offset %d", off)
 		}
 	}
+	if total != fm.Size {
+		// Source claimed Size but we got fewer bytes. Don't commit a
+		// truncated copy — Abort and let the caller roll back so a
+		// future Run sees the file as un-migrated and retries.
+		bw.Abort()
+		return total, fmt.Errorf("short read: got %d of %d bytes", total, fm.Size)
+	}
 	if err := bw.Commit(); err != nil {
-		return total, err
+		// Commit aborts internally via the bbolt tx returning, but the
+		// segments may have buffered bytes — they become orphans GC will
+		// reap when the new-side GC runs at Run's tail.
+		return total, fmt.Errorf("bulk commit: %w", err)
 	}
 	return total, nil
 }

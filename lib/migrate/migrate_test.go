@@ -310,6 +310,117 @@ func TestRunGCsNewFormatToo(t *testing.T) {
 	}
 }
 
+// TestMigratorSkipsCorruptSourceFiles simulates a corrupt legacy segment
+// (truncated to zero) and verifies:
+//   - migrate.Run does NOT return an error (per-file failures don't take
+//     down the whole migration),
+//   - the affected files are counted in Failures,
+//   - they are NOT visible in the new store (rollback worked),
+//   - the legacy subtree is preserved so the operator can investigate
+//     and re-run.
+func TestMigratorSkipsCorruptSourceFiles(t *testing.T) {
+	hot, cold, expected := makeOldFixture(t)
+
+	// Truncate the only hot segment so every file read fails.
+	segFile := filepath.Join(hot, ".place", "segments", "00000000.seg")
+	if _, err := os.Stat(segFile); err != nil {
+		t.Fatalf("expected segment file: %v", err)
+	}
+	if err := os.Truncate(segFile, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openNew(t, hot, cold)
+	stats, err := migrate.Run(st)
+	if err != nil {
+		t.Fatalf("Run errored (should have soft-failed per file): %v", err)
+	}
+
+	// All regular files failed.
+	if stats.Failures != len(expected) {
+		t.Errorf("Failures=%d want %d", stats.Failures, len(expected))
+	}
+	if stats.Files != 0 {
+		t.Errorf("Files=%d, expected 0 successful copies", stats.Files)
+	}
+	// But non-file entities migrated cleanly.
+	if stats.Dirs == 0 || stats.Symlinks == 0 {
+		t.Errorf("non-file entities didn't migrate: %+v", stats)
+	}
+
+	// None of the failed files should be reachable in the new store.
+	for rel := range expected {
+		if _, err := st.LookupPath("/" + rel); err == nil {
+			t.Errorf("failed file %q still visible after rollback", rel)
+		}
+	}
+
+	// Legacy subtree preserved for retry.
+	if !legacyExists(hot, cold) {
+		t.Errorf("legacy subtree removed despite failures — would prevent retry")
+	}
+}
+
+// TestMigratorRetriesAfterFix simulates the operator fixing the corruption
+// and re-running. The previously-failed files should now succeed and the
+// legacy tree should finally be cleaned up.
+func TestMigratorRetriesAfterFix(t *testing.T) {
+	hot, cold, expected := makeOldFixture(t)
+	segFile := filepath.Join(hot, ".place", "segments", "00000000.seg")
+	originalBytes, err := os.ReadFile(segFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Break it.
+	if err := os.Truncate(segFile, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openNew(t, hot, cold)
+	first, err := migrate.Run(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Failures == 0 {
+		t.Fatalf("expected failures from corrupted segment")
+	}
+
+	// "Operator fixes the underlying problem" — restore the segment bytes.
+	if err := os.WriteFile(segFile, originalBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := migrate.Run(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Failures != 0 {
+		t.Errorf("retry had failures=%d", second.Failures)
+	}
+	if second.Files != len(expected) {
+		t.Errorf("retry migrated %d files want %d", second.Files, len(expected))
+	}
+	// All files should now be reachable.
+	for rel, want := range expected {
+		n, err := st.LookupPath("/" + rel)
+		if err != nil {
+			t.Errorf("post-retry lookup %s: %v", rel, err)
+			continue
+		}
+		h, _ := st.OpenInode(n.Inode, 0)
+		got := make([]byte, len(want))
+		h.ReadAt(got, 0)
+		h.Close()
+		if !bytes.Equal(got, want) {
+			t.Errorf("post-retry content mismatch for %s", rel)
+		}
+	}
+	// Legacy gone after the clean retry.
+	if legacyExists(hot, cold) {
+		t.Errorf("legacy subtree still present after clean retry")
+	}
+}
+
 // TestIncrementalCleanup verifies that legacy .seg files are unlinked as
 // their last referencer migrates, rather than all at the end. We approximate
 // by checking that after Run completes there are no remaining files in
