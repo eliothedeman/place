@@ -29,11 +29,18 @@ func main() {
 	cold := flag.String("cold", "", "cold (slow) storage directory")
 	mountPoint := flag.String("mount", "", "FUSE mount point")
 	dbPath := flag.String("db", "", "DB path (default {hot}/.placefs/db.bolt)")
-	hotMax := flag.Int64("hot-max-bytes", 0, "max hot bytes before evict kicks in (0 disables eviction)")
-	hotTarget := flag.Int64("hot-target-bytes", 0, "target hot bytes after eviction")
+
+	// Byte-sized values accept human-readable suffixes (B/K/KB/KiB,
+	// M/MB/MiB, ...). All multi-char suffixes are 1024-based.
+	var hotMax, hotTarget bytesValue
+	flag.Var(&hotMax, "hot-max", "max hot tier usage before eviction kicks in, e.g. 500GB. 0 disables eviction")
+	flag.Var(&hotTarget, "hot-target", "target hot tier usage after eviction, e.g. 400GB")
+	stripeSize := bytesValue(index.DefaultStripeSize)
+	flag.Var(&stripeSize, "stripe", "stripe size (power of two), e.g. 64MiB")
+	segMax := bytesValue(index.DefaultSegmentMaxSize)
+	flag.Var(&segMax, "segment-max", "segment rotation size, e.g. 1GiB")
+
 	tick := flag.Duration("tick", 30*time.Second, "mover tick interval")
-	stripeSize := flag.Int64("stripe", index.DefaultStripeSize, "stripe size in bytes (power of two)")
-	segMax := flag.Int64("segment-max", index.DefaultSegmentMaxSize, "segment rotation size in bytes")
 	adminAddr := flag.String("admin-addr", ":9090", `host:port for /metrics + /healthz (empty disables the admin server)`)
 	healthMaxGap := flag.Duration("health-max-tick-gap", 5*time.Minute, "max gap since last mover tick before /healthz reports unhealthy (0 disables the check)")
 	shutdownGrace := flag.Duration("shutdown-grace", 30*time.Second, "max time to wait for FUSE unmount + mover stop on SIGTERM")
@@ -66,14 +73,14 @@ func main() {
 		HotDir:         *hot,
 		ColdDir:        *cold,
 		DBPath:         *dbPath,
-		StripeSize:     *stripeSize,
-		SegmentMaxSize: *segMax,
+		StripeSize:     int64(stripeSize),
+		SegmentMaxSize: int64(segMax),
 	})
 	if err != nil {
 		logger.Error("index open failed", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("index open", "stripe", *stripeSize, "segment_max", *segMax)
+	logger.Info("index open", "stripe", stripeSize.String(), "segment_max", segMax.String())
 	st, err := store.Open(idx)
 	if err != nil {
 		idx.Close()
@@ -86,8 +93,8 @@ func main() {
 
 	mv := mover.Start(mover.Config{
 		Index:          idx,
-		HotMaxBytes:    *hotMax,
-		HotTargetBytes: *hotTarget,
+		HotMaxBytes:    int64(hotMax),
+		HotTargetBytes: int64(hotTarget),
 		Tick:           *tick,
 		Logger:         logger,
 	})

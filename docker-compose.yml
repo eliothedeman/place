@@ -53,14 +53,17 @@ services:
     # Extra placefs flags go here. Hot/cold/mount paths are wired up by
     # docker-entrypoint.sh, so do NOT pass --hot/--cold/--mount.
     #
-    # The only flags you really need to set are --hot-max-bytes and
-    # --hot-target-bytes. Without those, the mover never evicts and
-    # the hot drive will eventually fill up. Pick a cap that fits your
-    # hot drive minus headroom for live writes.
+    # The only flags you really need to set are --hot-max and --hot-target.
+    # Without those, the mover never evicts and the hot drive will
+    # eventually fill up. Pick a cap that fits your hot drive minus
+    # headroom for live writes.
+    #
+    # Byte-sized flags accept human-readable values: 500GB, 1.5TiB,
+    # 10MB, or a raw byte count. All multi-char suffixes are 1024-based.
     #
     # command:
-    #   - --hot-max-bytes=10737418240    # 10 GiB cap on hot tier
-    #   - --hot-target-bytes=8589934592  # 8 GiB post-evict target
+    #   - --hot-max=500GB
+    #   - --hot-target=400GB
     #
     #   # Optional: structured logs for aggregators (Loki, Datadog, etc).
     #   - --log-format=json
