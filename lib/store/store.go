@@ -724,8 +724,36 @@ type SetAttr struct {
 
 // Setattr updates inode metadata. Size changes truncate or zero-extend the
 // file via L2.
+//
+// Truncation is intentionally ordered "fragments first, size last": we
+// drop the now-dead fragments before advertising the smaller Size, so a
+// crash between the two leaves at most "fragments past advertised end of
+// file" (harmless — readers clamp by Size and GC reaps the orphaned
+// segments) rather than "Size advertises bytes that no fragment covers"
+// (silent zero-fill).
 func (s *Store) Setattr(inode uint64, sa SetAttr) (Node, error) {
-	var truncatedTo *int64
+	if sa.Size != nil {
+		var curSize int64
+		if err := s.db.View(func(tx *bolt.Tx) error {
+			nv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
+			if nv == nil {
+				return ErrNotExist
+			}
+			nn, err := decodeNode(nv)
+			if err != nil {
+				return err
+			}
+			curSize = nn.Size
+			return nil
+		}); err != nil {
+			return Node{}, err
+		}
+		if *sa.Size < curSize {
+			if err := s.idx.Truncate(inode, *sa.Size); err != nil {
+				return Node{}, err
+			}
+		}
+	}
 	var n Node
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		nv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
@@ -753,12 +781,7 @@ func (s *Store) Setattr(inode uint64, sa SetAttr) (Node, error) {
 			nn.Atime = *sa.Atime
 		}
 		if sa.Size != nil {
-			newSize := *sa.Size
-			if newSize < nn.Size {
-				size := newSize
-				truncatedTo = &size
-			}
-			nn.Size = newSize
+			nn.Size = *sa.Size
 		}
 		nn.Ctime = now
 		if err := tx.Bucket(bucketNodes).Put(inodeKey(inode), encodeNode(nn)); err != nil {
@@ -769,11 +792,6 @@ func (s *Store) Setattr(inode uint64, sa SetAttr) (Node, error) {
 	})
 	if err != nil {
 		return Node{}, err
-	}
-	if truncatedTo != nil {
-		if err := s.idx.Truncate(inode, *truncatedTo); err != nil {
-			return Node{}, err
-		}
 	}
 	return n, nil
 }

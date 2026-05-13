@@ -19,6 +19,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eliothedeman/place/lib/index"
@@ -38,6 +39,11 @@ type Config struct {
 	// Tick is the polling interval for both eviction and GC. Default 30s.
 	Tick time.Duration
 
+	// MaxBackoff is the longest the loop will sleep between attempts when
+	// errors are coming back consecutively. Default 5 minutes. A run of
+	// errors doubles the sleep up to this cap; a clean tick resets it.
+	MaxBackoff time.Duration
+
 	// Logger is optional; defaults to log.Printf-with-prefix. Use a no-op
 	// for quiet tests.
 	Logger func(format string, args ...any)
@@ -49,12 +55,27 @@ type Mover struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	log    func(format string, args ...any)
+
+	// metrics — read with the matching accessor methods so callers don't
+	// have to know the layout. Atomic so they're safe to read off-thread
+	// from a /metrics handler.
+	evictRuns     atomic.Int64
+	gcRuns        atomic.Int64
+	movesOK       atomic.Int64
+	moveFailures  atomic.Int64
+	bytesMoved    atomic.Int64
+	consecErrs    atomic.Int64
+	lastTickUnix  atomic.Int64
+	lastErrUnix   atomic.Int64
 }
 
 // Start launches the mover loop. Returns immediately.
 func Start(cfg Config) *Mover {
 	if cfg.Tick == 0 {
 		cfg.Tick = 30 * time.Second
+	}
+	if cfg.MaxBackoff == 0 {
+		cfg.MaxBackoff = 5 * time.Minute
 	}
 	if cfg.HotTargetBytes == 0 && cfg.HotMaxBytes > 0 {
 		cfg.HotTargetBytes = int64(float64(cfg.HotMaxBytes) * 0.8)
@@ -72,7 +93,9 @@ func Start(cfg Config) *Mover {
 	return m
 }
 
-// Stop signals the loop to exit and waits for it.
+// Stop signals the loop to exit and waits for it. Eviction stops after the
+// current candidate's Move completes — Moves are bounded by stripe size, so
+// a Stop after SIGTERM normally returns in seconds, not the full Move time.
 func (m *Mover) Stop() {
 	m.cancel()
 	m.wg.Wait()
@@ -81,34 +104,93 @@ func (m *Mover) Stop() {
 // RunOnce executes one pass of every policy synchronously. Tests call this
 // directly to avoid needing a real ticker.
 func (m *Mover) RunOnce() error {
-	if err := m.evictOnce(); err != nil {
+	if err := m.evictOnce(context.Background()); err != nil {
 		return err
 	}
 	return m.gcOnce()
 }
 
+// Stats is a snapshot of mover counters. Cheap; safe to call frequently.
+type Stats struct {
+	EvictRuns        int64
+	GCRuns           int64
+	MovesOK          int64
+	MoveFailures     int64
+	BytesMoved       int64
+	ConsecutiveErrs  int64
+	LastTickUnix     int64 // 0 if the loop has never ticked
+	LastErrorUnix    int64 // 0 if no errors observed yet
+}
+
+// Stats returns a snapshot of the mover's lifetime counters.
+func (m *Mover) Stats() Stats {
+	return Stats{
+		EvictRuns:       m.evictRuns.Load(),
+		GCRuns:          m.gcRuns.Load(),
+		MovesOK:         m.movesOK.Load(),
+		MoveFailures:    m.moveFailures.Load(),
+		BytesMoved:      m.bytesMoved.Load(),
+		ConsecutiveErrs: m.consecErrs.Load(),
+		LastTickUnix:    m.lastTickUnix.Load(),
+		LastErrorUnix:   m.lastErrUnix.Load(),
+	}
+}
+
 func (m *Mover) loop(ctx context.Context) {
 	defer m.wg.Done()
-	t := time.NewTicker(m.cfg.Tick)
-	defer t.Stop()
+	delay := m.cfg.Tick
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			if err := m.evictOnce(); err != nil {
-				m.log("evict: %v", err)
+		case <-time.After(delay):
+		}
+		hadErr := false
+		if err := m.evictOnce(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
 			}
-			if err := m.gcOnce(); err != nil {
-				m.log("gc: %v", err)
-			}
+			m.log("evict: %v", err)
+			hadErr = true
+		}
+		if err := m.gcOnce(); err != nil {
+			m.log("gc: %v", err)
+			hadErr = true
+		}
+		m.lastTickUnix.Store(time.Now().Unix())
+		if hadErr {
+			c := m.consecErrs.Add(1)
+			m.lastErrUnix.Store(time.Now().Unix())
+			delay = backoff(m.cfg.Tick, m.cfg.MaxBackoff, int(c))
+		} else {
+			m.consecErrs.Store(0)
+			delay = m.cfg.Tick
 		}
 	}
 }
 
+// backoff doubles tick until cap, capped by MaxBackoff. Conservative shape:
+// a wedged loop sleeps progressively longer so it stops drowning the logs
+// and storming the index with retries, without ever fully giving up.
+func backoff(base, max time.Duration, consec int) time.Duration {
+	if consec <= 0 {
+		return base
+	}
+	d := base
+	for i := 0; i < consec && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
 // evictOnce runs the hot-pressure policy: if hot usage is over the cap,
 // move stripes from hot to cold (in iter order) until under the target.
-func (m *Mover) evictOnce() error {
+// ctx-aware so a Stop() during a long candidate list breaks out promptly.
+func (m *Mover) evictOnce(ctx context.Context) error {
+	m.evictRuns.Add(1)
 	idx := m.cfg.Index
 	if m.cfg.HotMaxBytes <= 0 {
 		return nil
@@ -119,9 +201,6 @@ func (m *Mover) evictOnce() error {
 	}
 	m.log("hot pressure: used=%d cap=%d target=%d", used, m.cfg.HotMaxBytes, m.cfg.HotTargetBytes)
 
-	// Collect candidates first so we can release the iteration tx before
-	// doing the slow Move IO. Stop collecting once we have enough bytes
-	// queued to plausibly hit the target.
 	type cand struct {
 		inode    uint64
 		stripeID uint32
@@ -136,20 +215,28 @@ func (m *Mover) evictOnce() error {
 		}
 		cands = append(cands, cand{s.Inode, s.StripeID, s.HotBytes})
 		queued += s.HotBytes
-		return queued < want*2 // 2x headroom for shadowed overlap
+		return queued < want*2
 	})
 	if err != nil {
 		return err
 	}
 
 	for _, c := range cands {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if idx.HotUsedBytes() <= m.cfg.HotTargetBytes {
 			break
 		}
 		if err := idx.Move(c.inode, c.stripeID, segment.TierCold); err != nil {
+			m.moveFailures.Add(1)
 			m.log("move(inode=%d stripe=%d): %v", c.inode, c.stripeID, err)
 			continue
 		}
+		m.movesOK.Add(1)
+		m.bytesMoved.Add(c.hotBytes)
 		m.log("moved inode=%d stripe=%d ~%d bytes", c.inode, c.stripeID, c.hotBytes)
 	}
 	return nil
@@ -157,5 +244,6 @@ func (m *Mover) evictOnce() error {
 
 // gcOnce drops segments with zero live references.
 func (m *Mover) gcOnce() error {
+	m.gcRuns.Add(1)
 	return m.cfg.Index.GC()
 }

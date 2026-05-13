@@ -178,12 +178,19 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 
 var _ fs.FileFlusher = (*handle)(nil)
 
+// Flush fires on every close(2) — including ones from briefly-opened
+// readers — so it must be cheap. Per-write fsyncs already happened on the
+// WriteAt path; the only outstanding bytes are inside an explicit
+// BulkWriter session, which isn't reachable via the FUSE handle. So Flush
+// is a no-op.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
-	return errno(h.h.Sync())
+	return 0
 }
 
 var _ fs.FileFsyncer = (*handle)(nil)
 
+// Fsync is an explicit user-requested durability barrier (fsync(2)).
+// Force a sync across all open segments + the bbolt index.
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	return errno(h.h.Sync())
 }

@@ -9,6 +9,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eliothedeman/place/lib/admin"
 	"github.com/eliothedeman/place/lib/fuselayer"
 	"github.com/eliothedeman/place/lib/index"
 	"github.com/eliothedeman/place/lib/migrate"
@@ -36,6 +38,9 @@ func main() {
 	tick := flag.Duration("tick", 30*time.Second, "mover tick interval")
 	stripeSize := flag.Int64("stripe", index.DefaultStripeSize, "stripe size in bytes (power of two)")
 	segMax := flag.Int64("segment-max", index.DefaultSegmentMaxSize, "segment rotation size in bytes")
+	adminAddr := flag.String("admin-addr", ":9090", `host:port for /metrics + /healthz (empty disables the admin server)`)
+	healthMaxGap := flag.Duration("health-max-tick-gap", 5*time.Minute, "max gap since last mover tick before /healthz reports unhealthy (0 disables the check)")
+	shutdownGrace := flag.Duration("shutdown-grace", 30*time.Second, "max time to wait for FUSE unmount + mover stop on SIGTERM")
 	flag.Parse()
 
 	if *hot == "" || *cold == "" || *mountPoint == "" {
@@ -43,7 +48,7 @@ func main() {
 		os.Exit(2)
 	}
 	log.Printf("placefs: starting (hot=%s cold=%s mount=%s)", *hot, *cold, *mountPoint)
-	for _, p := range []string{*hot, *cold} {
+	for _, p := range []string{*hot, *cold, *mountPoint} {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			log.Fatalf("mkdir %s: %v", p, err)
 		}
@@ -67,11 +72,9 @@ func main() {
 	}
 	log.Printf("placefs: store open")
 
-	// One unconditional call. migrate.Run figures out for itself whether
-	// there's legacy data to migrate, picks up partial progress from a
-	// prior interrupted run, reaps incrementally, and cleans up the
-	// legacy subtree when it's done. It also runs the new-format index's
-	// own GC pass to drop any unreferenced new segments.
+	// Migration is unconditional — it self-detects "nothing to do" and
+	// short-circuits. It runs before mount so partial state is never
+	// user-visible.
 	stats, err := migrate.Run(st)
 	if err != nil {
 		st.Close()
@@ -90,6 +93,23 @@ func main() {
 		Tick:           *tick,
 	})
 
+	startTime := time.Now()
+	adminCtx, cancelAdmin := context.WithCancel(context.Background())
+	defer cancelAdmin()
+	if *adminAddr != "" {
+		if _, err := admin.Serve(adminCtx, *adminAddr, admin.Deps{
+			Index:            idx,
+			Mover:            mv,
+			HealthMaxTickGap: *healthMaxGap,
+			StartTime:        startTime,
+		}); err != nil {
+			mv.Stop()
+			st.Close()
+			log.Fatalf("admin server: %v", err)
+		}
+		log.Printf("placefs: admin server on %s (/healthz /metrics)", *adminAddr)
+	}
+
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			Name:   "placefs",
@@ -98,20 +118,33 @@ func main() {
 	}
 	server, err := fs.Mount(*mountPoint, fuselayer.NewRoot(st), opts)
 	if err != nil {
+		cancelAdmin()
 		mv.Stop()
 		st.Close()
 		log.Fatalf("mount: %v", err)
 	}
 	log.Printf("placefs mounted at %s (hot=%s cold=%s)", *mountPoint, *hot, *cold)
+	admin.MarkReady()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigs
-		log.Printf("placefs: signal received, unmounting")
-		server.Unmount()
+		sig := <-sigs
+		log.Printf("placefs: %s received, unmounting (grace=%s)", sig, *shutdownGrace)
+		done := make(chan struct{})
+		go func() {
+			server.Unmount()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(*shutdownGrace):
+			log.Printf("placefs: shutdown grace exceeded; forcing exit")
+			os.Exit(1)
+		}
 	}()
 	server.Wait()
+	cancelAdmin()
 	mv.Stop()
 	if err := st.Close(); err != nil {
 		log.Printf("close: %v", err)

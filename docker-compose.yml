@@ -24,6 +24,11 @@ services:
     devices:
       - /dev/fuse:/dev/fuse
 
+    # Prometheus + healthz on :9090. Bind to 127.0.0.1 by default; flip to
+    # 0.0.0.0:9090 if you scrape this from another host on a trusted network.
+    ports:
+      - "127.0.0.1:9090:9090"
+
     volumes:
       # Hot tier — point at your fast (SSD/NVMe) TrueNAS dataset.
       - type: bind
@@ -65,4 +70,5 @@ services:
     #   - --hot-max-bytes=2147483648     # 2 GiB cap on hot tier
     #   - --hot-target-bytes=1610612736  # 1.5 GiB post-evict target
     #   - --tick=10s                     # mover poll interval
-    #   - --skip-migrate                 # if you've already migrated
+    #   - --admin-addr=:9090             # /metrics /healthz endpoint (default :9090)
+    #   - --shutdown-grace=30s           # SIGTERM patience before exit(1)

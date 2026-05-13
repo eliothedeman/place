@@ -310,11 +310,17 @@ func (s *Set) Dir() string { return s.dir }
 
 // Active returns a segment with at least recordSize bytes of headroom,
 // rotating (sealing current + opening a new file) if needed.
+//
+// Rotation order: fsync the outgoing segment so its records are durable;
+// create the new file; fsync the parent directory so the new file's
+// dentry survives a power loss; install it as the active write target.
+// Without the directory fsync, ext4/xfs can keep the new file invisible
+// after crash and the next process would think the rotated-out bytes
+// were the last word — corrupting any new appends made just before crash.
 func (s *Set) Active(recordSize int64) (*Segment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active != nil {
-		// Read size with the segment's own lock to stay race-free.
 		s.active.mu.Lock()
 		fits := s.active.size+recordSize <= s.maxSize
 		s.active.mu.Unlock()
@@ -333,9 +339,28 @@ func (s *Set) Active(recordSize int64) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := fsyncDir(s.dir); err != nil {
+		seg.Close()
+		return nil, fmt.Errorf("segment: fsync rotation dir: %w", err)
+	}
 	s.segments[id] = seg
 	s.active = seg
 	return seg, nil
+}
+
+// fsyncDir opens dir read-only and fsyncs it. Used after a new segment
+// file is created so the dirent itself survives a power loss.
+func fsyncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // ActiveID returns the id of the current write target without rotating or
@@ -370,7 +395,9 @@ func (s *Set) All() []uint32 {
 }
 
 // Remove closes and unlinks one segment. Caller must ensure nothing in L2
-// still references it.
+// still references it. The parent dir is fsynced after unlink so the
+// removal survives a power loss — otherwise a crash could re-expose a
+// .seg file whose contents are stale relative to the bbolt index.
 func (s *Set) Remove(id uint32) error {
 	s.mu.Lock()
 	seg, ok := s.segments[id]
@@ -384,7 +411,10 @@ func (s *Set) Remove(id uint32) error {
 	}
 	s.mu.Unlock()
 	_ = seg.Close()
-	return os.Remove(filepath.Join(s.dir, segFileName(id)))
+	if err := os.Remove(filepath.Join(s.dir, segFileName(id))); err != nil {
+		return err
+	}
+	return fsyncDir(s.dir)
 }
 
 // RepairTail scans only the active segment and truncates any torn record at
