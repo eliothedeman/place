@@ -335,8 +335,8 @@ func validName(name string) error {
 
 // Create makes a new regular file at (parent, name). Returns the new node
 // and an open Handle. mode's permission bits are taken from mode & 0o7777;
-// the type bits are forced to S_IFREG.
-func (s *Store) Create(parent uint64, name string, mode Mode) (Node, *Handle, error) {
+// the type bits are forced to S_IFREG. The new file is owned by (uid, gid).
+func (s *Store) Create(parent uint64, name string, mode Mode, uid, gid uint32) (Node, *Handle, error) {
 	if err := validName(name); err != nil {
 		return Node{}, nil, err
 	}
@@ -357,6 +357,8 @@ func (s *Store) Create(parent uint64, name string, mode Mode) (Node, *Handle, er
 			Inode: id,
 			Mode:  ModeRegular | (mode & PermMask),
 			Nlink: 1,
+			UID:   uid,
+			GID:   gid,
 			Size:  0,
 			Mtime: now, Ctime: now, Atime: now,
 		}
@@ -373,8 +375,8 @@ func (s *Store) Create(parent uint64, name string, mode Mode) (Node, *Handle, er
 	return n, &Handle{store: s, inode: n.Inode}, nil
 }
 
-// Mkdir creates a directory at (parent, name).
-func (s *Store) Mkdir(parent uint64, name string, mode Mode) (Node, error) {
+// Mkdir creates a directory at (parent, name) owned by (uid, gid).
+func (s *Store) Mkdir(parent uint64, name string, mode Mode, uid, gid uint32) (Node, error) {
 	if err := validName(name); err != nil {
 		return Node{}, err
 	}
@@ -395,6 +397,8 @@ func (s *Store) Mkdir(parent uint64, name string, mode Mode) (Node, error) {
 			Inode: id,
 			Mode:  ModeDir | (mode & PermMask),
 			Nlink: 2,
+			UID:   uid,
+			GID:   gid,
 			Mtime: now, Ctime: now, Atime: now,
 		}
 		if err := tx.Bucket(bucketNodes).Put(inodeKey(id), encodeNode(n)); err != nil {
@@ -413,8 +417,9 @@ func (s *Store) Mkdir(parent uint64, name string, mode Mode) (Node, error) {
 	return n, nil
 }
 
-// Symlink creates a symlink at (parent, name) pointing to target.
-func (s *Store) Symlink(parent uint64, name, target string) (Node, error) {
+// Symlink creates a symlink at (parent, name) pointing to target, owned
+// by (uid, gid).
+func (s *Store) Symlink(parent uint64, name, target string, uid, gid uint32) (Node, error) {
 	if err := validName(name); err != nil {
 		return Node{}, err
 	}
@@ -435,6 +440,8 @@ func (s *Store) Symlink(parent uint64, name, target string) (Node, error) {
 			Inode:         id,
 			Mode:          ModeSymlink | 0o777,
 			Nlink:         1,
+			UID:           uid,
+			GID:           gid,
 			Size:          int64(len(target)),
 			Mtime:         now, Ctime: now, Atime: now,
 			SymlinkTarget: target,

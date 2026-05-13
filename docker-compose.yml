@@ -61,6 +61,19 @@ services:
     # Byte-sized flags accept human-readable values: 500GB, 1.5TiB,
     # 10MB, or a raw byte count. All multi-char suffixes are 1024-based.
     #
+    # Sharing the mount with other containers (qbittorrent, sonarr, etc):
+    #   --allow-other (default true) lets non-mounter UIDs touch the mount;
+    #   --default-permissions (default true) has the kernel enforce mode
+    #   bits, so chmod/chown on the mount actually take effect. Both are
+    #   on by default — you only need to know about them if you set them
+    #   off explicitly.
+    #
+    # New files are owned by the calling process's UID/GID. So if
+    # qbittorrent runs as UID 1000, files it creates inside the mount
+    # are owned by 1000 — which is what you want. Existing files
+    # created before this fix are root-owned; chown them once on the
+    # host (or via `exec -u 0` into the container).
+    #
     # command:
     #   - --hot-max=500GB
     #   - --hot-target=400GB

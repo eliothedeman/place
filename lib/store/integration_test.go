@@ -20,7 +20,7 @@ const TierCold = index.TierCold
 // matches what we'd get from a sequential write.
 func TestTorrentLikeRandomOrderWrites(t *testing.T) {
 	s := newStore(t)
-	_, h, err := s.Create(RootInode, "movie.mkv", 0o644)
+	_, h, err := s.Create(RootInode, "movie.mkv", 0o644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestEvictUnderPressureKeepsDataReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, h, _ := s.Create(RootInode, "evict-me", 0o644)
+	_, h, _ := s.Create(RootInode, "evict-me", 0o644, 0, 0)
 	defer h.Close()
 
 	const size = 500 << 10 // divides evenly by len("EVICT")=5
@@ -124,12 +124,12 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Mkdir(RootInode, "dir", 0o755); err != nil {
+	if _, err := s.Mkdir(RootInode, "dir", 0o755, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	d, _ := s.Lookup(RootInode, "dir")
 	want := []byte("durable bytes")
-	_, h, _ := s.Create(d.Inode, "f", 0o644)
+	_, h, _ := s.Create(d.Inode, "f", 0o644, 0, 0)
 	if _, err := h.WriteAt(want, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestPersistsAcrossReopen(t *testing.T) {
 // confirm bytes/size/mtime all line up.
 func TestBulkWriterRoundTrip(t *testing.T) {
 	s := newStore(t)
-	n, h, err := s.Create(RootInode, "bulk.bin", 0o644)
+	n, h, err := s.Create(RootInode, "bulk.bin", 0o644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestBulkWriterRoundTrip(t *testing.T) {
 // not the default tier.
 func TestBulkWriterLandsInTargetTier(t *testing.T) {
 	s := newStore(t)
-	n, h, err := s.Create(RootInode, "tiered.bin", 0o644)
+	n, h, err := s.Create(RootInode, "tiered.bin", 0o644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestTornTailRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ := Open(idx)
-	_, h, _ := s.Create(RootInode, "x", 0o644)
+	_, h, _ := s.Create(RootInode, "x", 0o644, 0, 0)
 	data := bytes.Repeat([]byte("X"), 4096)
 	h.WriteAt(data, 0)
 	h.Sync()

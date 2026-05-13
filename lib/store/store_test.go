@@ -37,7 +37,7 @@ func TestRootExistsAfterOpen(t *testing.T) {
 
 func TestCreateAndReadBack(t *testing.T) {
 	s := newStore(t)
-	n, h, err := s.Create(RootInode, "hello.txt", 0o644)
+	n, h, err := s.Create(RootInode, "hello.txt", 0o644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestCreateAndReadBack(t *testing.T) {
 
 func TestReadPastEOFShortReturns(t *testing.T) {
 	s := newStore(t)
-	_, h, _ := s.Create(RootInode, "x", 0o644)
+	_, h, _ := s.Create(RootInode, "x", 0o644, 0, 0)
 	h.WriteAt([]byte("abc"), 0)
 	buf := make([]byte, 100)
 	n, err := h.ReadAt(buf, 0)
@@ -91,7 +91,7 @@ func TestReadPastEOFShortReturns(t *testing.T) {
 
 func TestReadSparseGapIsZero(t *testing.T) {
 	s := newStore(t)
-	_, h, _ := s.Create(RootInode, "sparse", 0o644)
+	_, h, _ := s.Create(RootInode, "sparse", 0o644, 0, 0)
 	h.WriteAt([]byte("END"), 100) // write 3 bytes at offset 100
 	buf := make([]byte, 103)
 	n, err := h.ReadAt(buf, 0)
@@ -114,17 +114,17 @@ func TestReadSparseGapIsZero(t *testing.T) {
 
 func TestMkdirReaddir(t *testing.T) {
 	s := newStore(t)
-	if _, err := s.Mkdir(RootInode, "sub", 0o755); err != nil {
+	if _, err := s.Mkdir(RootInode, "sub", 0o755, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	sub, err := s.Lookup(RootInode, "sub")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Create(sub.Inode, "a.txt", 0o644); err != nil {
+	if _, _, err := s.Create(sub.Inode, "a.txt", 0o644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Create(sub.Inode, "b.txt", 0o644); err != nil {
+	if _, _, err := s.Create(sub.Inode, "b.txt", 0o644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := s.Readdir(sub.Inode)
@@ -138,10 +138,10 @@ func TestMkdirReaddir(t *testing.T) {
 
 func TestCreateExistingReturnsExist(t *testing.T) {
 	s := newStore(t)
-	if _, _, err := s.Create(RootInode, "dup", 0o644); err != nil {
+	if _, _, err := s.Create(RootInode, "dup", 0o644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := s.Create(RootInode, "dup", 0o644)
+	_, _, err := s.Create(RootInode, "dup", 0o644, 0, 0)
 	if !errors.Is(err, ErrExist) {
 		t.Fatalf("second Create returned %v, want EEXIST", err)
 	}
@@ -149,7 +149,7 @@ func TestCreateExistingReturnsExist(t *testing.T) {
 
 func TestUnlinkRemovesEntryAndFragments(t *testing.T) {
 	s := newStore(t)
-	n, h, _ := s.Create(RootInode, "gone", 0o644)
+	n, h, _ := s.Create(RootInode, "gone", 0o644, 0, 0)
 	h.WriteAt([]byte("bye"), 0)
 	if err := s.Unlink(RootInode, "gone"); err != nil {
 		t.Fatal(err)
@@ -168,8 +168,8 @@ func TestUnlinkRemovesEntryAndFragments(t *testing.T) {
 
 func TestRmdirNotEmpty(t *testing.T) {
 	s := newStore(t)
-	d, _ := s.Mkdir(RootInode, "d", 0o755)
-	s.Create(d.Inode, "f", 0o644)
+	d, _ := s.Mkdir(RootInode, "d", 0o755, 0, 0)
+	s.Create(d.Inode, "f", 0o644, 0, 0)
 	err := s.Rmdir(RootInode, "d")
 	if !errors.Is(err, ErrNotEmpty) {
 		t.Fatalf("rmdir non-empty: %v want ENOTEMPTY", err)
@@ -178,9 +178,9 @@ func TestRmdirNotEmpty(t *testing.T) {
 
 func TestRenameOverwriteFile(t *testing.T) {
 	s := newStore(t)
-	_, h1, _ := s.Create(RootInode, "src", 0o644)
+	_, h1, _ := s.Create(RootInode, "src", 0o644, 0, 0)
 	h1.WriteAt([]byte("source"), 0)
-	_, h2, _ := s.Create(RootInode, "dst", 0o644)
+	_, h2, _ := s.Create(RootInode, "dst", 0o644, 0, 0)
 	h2.WriteAt([]byte("destination"), 0)
 
 	if err := s.Rename(RootInode, "src", RootInode, "dst"); err != nil {
@@ -203,9 +203,9 @@ func TestRenameOverwriteFile(t *testing.T) {
 
 func TestRenameCrossDir(t *testing.T) {
 	s := newStore(t)
-	a, _ := s.Mkdir(RootInode, "A", 0o755)
-	b, _ := s.Mkdir(RootInode, "B", 0o755)
-	s.Create(a.Inode, "x", 0o644)
+	a, _ := s.Mkdir(RootInode, "A", 0o755, 0, 0)
+	b, _ := s.Mkdir(RootInode, "B", 0o755, 0, 0)
+	s.Create(a.Inode, "x", 0o644, 0, 0)
 	if err := s.Rename(a.Inode, "x", b.Inode, "y"); err != nil {
 		t.Fatal(err)
 	}
@@ -219,8 +219,8 @@ func TestRenameCrossDir(t *testing.T) {
 
 func TestRenameDirIntoSelfRejected(t *testing.T) {
 	s := newStore(t)
-	a, _ := s.Mkdir(RootInode, "A", 0o755)
-	b, _ := s.Mkdir(a.Inode, "B", 0o755)
+	a, _ := s.Mkdir(RootInode, "A", 0o755, 0, 0)
+	b, _ := s.Mkdir(a.Inode, "B", 0o755, 0, 0)
 	err := s.Rename(RootInode, "A", b.Inode, "moved")
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("expected EINVAL for cycle, got %v", err)
@@ -229,7 +229,7 @@ func TestRenameDirIntoSelfRejected(t *testing.T) {
 
 func TestSymlinkReadlink(t *testing.T) {
 	s := newStore(t)
-	n, err := s.Symlink(RootInode, "ptr", "/some/where")
+	n, err := s.Symlink(RootInode, "ptr", "/some/where", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestSymlinkReadlink(t *testing.T) {
 
 func TestHardlinkSharesData(t *testing.T) {
 	s := newStore(t)
-	n, h, _ := s.Create(RootInode, "orig", 0o644)
+	n, h, _ := s.Create(RootInode, "orig", 0o644, 0, 0)
 	h.WriteAt([]byte("shared"), 0)
 	_, err := s.Link(n.Inode, RootInode, "alias")
 	if err != nil {
@@ -277,7 +277,7 @@ func TestHardlinkSharesData(t *testing.T) {
 
 func TestSetattrTruncate(t *testing.T) {
 	s := newStore(t)
-	n, h, _ := s.Create(RootInode, "trunc", 0o644)
+	n, h, _ := s.Create(RootInode, "trunc", 0o644, 0, 0)
 	h.WriteAt(bytes.Repeat([]byte("x"), 1024), 0)
 	zero := int64(10)
 	if _, err := s.Setattr(n.Inode, SetAttr{Size: &zero}); err != nil {
@@ -297,9 +297,9 @@ func TestSetattrTruncate(t *testing.T) {
 
 func TestLookupPath(t *testing.T) {
 	s := newStore(t)
-	a, _ := s.Mkdir(RootInode, "a", 0o755)
-	b, _ := s.Mkdir(a.Inode, "b", 0o755)
-	s.Create(b.Inode, "c.txt", 0o644)
+	a, _ := s.Mkdir(RootInode, "a", 0o755, 0, 0)
+	b, _ := s.Mkdir(a.Inode, "b", 0o755, 0, 0)
+	s.Create(b.Inode, "c.txt", 0o644, 0, 0)
 
 	n, err := s.LookupPath("/a/b/c.txt")
 	if err != nil {
@@ -321,7 +321,7 @@ func TestInvalidNamesRejected(t *testing.T) {
 	s := newStore(t)
 	cases := []string{"", ".", "..", "a/b", "a\x00b"}
 	for _, name := range cases {
-		_, _, err := s.Create(RootInode, name, 0o644)
+		_, _, err := s.Create(RootInode, name, 0o644, 0, 0)
 		if !errors.Is(err, ErrInvalid) {
 			t.Errorf("Create(%q) = %v, want EINVAL", name, err)
 		}

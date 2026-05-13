@@ -20,7 +20,7 @@ import (
 // more bytes than fragments cover.
 func TestSetattrTruncateAtomicity(t *testing.T) {
 	s := newStore(t)
-	n, h, _ := s.Create(RootInode, "atomicity", 0o644)
+	n, h, _ := s.Create(RootInode, "atomicity", 0o644, 0, 0)
 	body := bytes.Repeat([]byte("Q"), 4096)
 	if _, err := h.WriteAt(body, 0); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestOrphanSegmentBytesAfterCrashSurfaceAsSparseReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, h, _ := s.Create(RootInode, "orphans", 0o644)
+	n, h, _ := s.Create(RootInode, "orphans", 0o644, 0, 0)
 	// Force at least one segment to exist by writing then truncating to 0.
 	h.WriteAt([]byte{0}, 0)
 	zero := int64(0)
@@ -151,7 +151,7 @@ func TestOrphanSegmentBytesAfterCrashSurfaceAsSparseReads(t *testing.T) {
 // back — leaves the file unmodified from the reader's point of view.
 func TestBulkWriterAbortLeavesNoVisibleData(t *testing.T) {
 	s := newStore(t)
-	_, h, _ := s.Create(RootInode, "abort.bin", 0o644)
+	_, h, _ := s.Create(RootInode, "abort.bin", 0o644, 0, 0)
 	defer h.Close()
 	h.WriteAt([]byte("HELLO"), 0)
 	preStat, _ := s.Stat(h.Inode())

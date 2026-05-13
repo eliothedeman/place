@@ -200,7 +200,8 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	var resFile fs.FileHandle
 	var resErrno syscall.Errno
 	n.root.trackOp("create", func() syscall.Errno {
-		nn, h, err := n.store.Create(n.inode, name, store.Mode(mode))
+		uid, gid := callerCreds(ctx)
+		nn, h, err := n.store.Create(n.inode, name, store.Mode(mode), uid, gid)
 		if err != nil {
 			resErrno = errno(err)
 			return resErrno
@@ -211,6 +212,17 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		return 0
 	})
 	return resInode, resFile, 0, resErrno
+}
+
+// callerCreds returns the calling process's effective uid/gid via the
+// FUSE context. If the caller is unavailable (shouldn't happen in real
+// requests, but defends against tests), returns 0/0 — same as root,
+// which preserves pre-uid-propagation behavior.
+func callerCreds(ctx context.Context) (uint32, uint32) {
+	if c, ok := fuse.FromContext(ctx); ok {
+		return c.Uid, c.Gid
+	}
+	return 0, 0
 }
 
 var _ fs.NodeOpener = (*node)(nil)
@@ -303,7 +315,8 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
 	n.root.trackOp("mkdir", func() syscall.Errno {
-		nn, err := n.store.Mkdir(n.inode, name, store.Mode(mode))
+		uid, gid := callerCreds(ctx)
+		nn, err := n.store.Mkdir(n.inode, name, store.Mode(mode), uid, gid)
 		if err != nil {
 			resErrno = errno(err)
 			return resErrno
@@ -351,7 +364,8 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
 	n.root.trackOp("symlink", func() syscall.Errno {
-		nn, err := n.store.Symlink(n.inode, name, target)
+		uid, gid := callerCreds(ctx)
+		nn, err := n.store.Symlink(n.inode, name, target, uid, gid)
 		if err != nil {
 			resErrno = errno(err)
 			return resErrno
