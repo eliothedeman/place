@@ -38,12 +38,15 @@ func main() {
 	stripeSize := flag.Int64("stripe", index.DefaultStripeSize, "stripe size in bytes (power of two)")
 	segMax := flag.Int64("segment-max", index.DefaultSegmentMaxSize, "segment rotation size in bytes")
 	skipMigrate := flag.Bool("skip-migrate", false, "do not run the old→new migrator even if old data is detected")
+	migOldDB := flag.String("migrate-old-db", "", "explicit path to the legacy DB (overrides auto-detection)")
+	verbose := flag.Bool("verbose", false, "log every migrated file/dir/symlink and every mover decision")
 	flag.Parse()
 
 	if *hot == "" || *cold == "" || *mountPoint == "" {
 		fmt.Fprintln(os.Stderr, "all of -hot, -cold, -mount are required")
 		os.Exit(2)
 	}
+	log.Printf("placefs: starting (hot=%s cold=%s mount=%s)", *hot, *cold, *mountPoint)
 	for _, p := range []string{*hot, *cold} {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			log.Fatalf("mkdir %s: %v", p, err)
@@ -60,40 +63,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("index open: %v", err)
 	}
+	log.Printf("placefs: index open (stripe=%d segment-max=%d)", *stripeSize, *segMax)
 	st, err := store.Open(idx)
 	if err != nil {
 		idx.Close()
 		log.Fatalf("store open: %v", err)
 	}
+	log.Printf("placefs: store open")
 
-	// Old-format detection. We migrate when:
-	//   1. The -hot directory still has the legacy .place.db + .place/segments
-	//      layout (LooksLikeOldFormat covers both checks), AND
-	//   2. The new store is empty (only root inode), so we're not merging
-	//      old data into an already-populated new store.
-	// The user can pass -skip-migrate to bypass this for any reason
-	// (e.g. they've already migrated and just haven't deleted the old files).
-	if !*skipMigrate && migrate.LooksLikeOldFormat(*hot) {
-		empty, err := storeIsEmpty(st)
-		if err != nil {
-			st.Close()
-			log.Fatalf("store empty check: %v", err)
-		}
-		if !empty {
-			log.Printf("placefs: old-format data detected at %s but new store is non-empty; skipping migration", *hot)
-		} else {
-			log.Printf("placefs: old-format data detected at %s — running migrator", *hot)
-			stats, err := migrate.Run(st, migrate.Options{
-				OldHot:  *hot,
-				OldCold: *cold,
-			})
-			if err != nil {
-				st.Close()
-				log.Fatalf("migrate: %v", err)
-			}
-			log.Printf("placefs: migration complete — %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes (old data still on disk under .place/; delete when you're satisfied)",
-				stats.Files, stats.Dirs, stats.Symlinks, stats.Hardlinks, stats.Bytes)
-		}
+	// Old-format detection. Log what we see so a quiet startup is
+	// self-explanatory: either the operator can tell migration ran, or they
+	// can tell why it didn't.
+	if *skipMigrate {
+		log.Printf("placefs: skip-migrate set; not scanning for legacy data")
+	} else {
+		runMigration(st, *hot, *cold, *migOldDB, *verbose)
 	}
 
 	mv := mover.Start(mover.Config{
@@ -138,4 +122,69 @@ func storeIsEmpty(s *store.Store) (bool, error) {
 		return false, err
 	}
 	return len(entries) == 0, nil
+}
+
+// runMigration logs each branch so a quiet startup is self-explanatory.
+func runMigration(st *store.Store, hot, cold, explicitDB string, verbose bool) {
+	if explicitDB != "" {
+		// Operator pinned the legacy DB path explicitly. Run regardless of
+		// what auto-detect would have said.
+		log.Printf("placefs: -migrate-old-db=%s; running migrator", explicitDB)
+		doMigrate(st, hot, cold, explicitDB, verbose)
+		return
+	}
+	dbPath, dbFound := migrate.FindLegacyDB(hot)
+	segDir := hot + "/.place/segments"
+	segExists := dirExists(segDir)
+	switch {
+	case !dbFound && !segExists:
+		log.Printf("placefs: no legacy data at %s (looked for %v and %s); nothing to migrate",
+			hot, migrate.LegacyDBCandidates(hot), segDir)
+		return
+	case !dbFound:
+		log.Printf("placefs: found %s but no legacy DB (looked for %v); skipping migration",
+			segDir, migrate.LegacyDBCandidates(hot))
+		return
+	case !segExists:
+		log.Printf("placefs: found legacy DB at %s but no %s; skipping migration",
+			dbPath, segDir)
+		return
+	}
+	empty, err := storeIsEmpty(st)
+	if err != nil {
+		st.Close()
+		log.Fatalf("store empty check: %v", err)
+	}
+	if !empty {
+		log.Printf("placefs: legacy data at %s but new store is non-empty; skipping migration (pass -skip-migrate to silence this)", hot)
+		return
+	}
+	log.Printf("placefs: legacy data found (db=%s, segments=%s) — running migrator", dbPath, segDir)
+	doMigrate(st, hot, cold, dbPath, verbose)
+}
+
+func doMigrate(st *store.Store, hot, cold, dbPath string, verbose bool) {
+	logf := func(string, ...any) {}
+	if verbose {
+		logf = func(format string, args ...any) {
+			log.Printf("placefs: migrate: "+format, args...)
+		}
+	}
+	stats, err := migrate.Run(st, migrate.Options{
+		OldHot:  hot,
+		OldCold: cold,
+		OldDB:   dbPath,
+		Logger:  logf,
+	})
+	if err != nil {
+		st.Close()
+		log.Fatalf("migrate: %v", err)
+	}
+	log.Printf("placefs: migration complete — %d files, %d dirs, %d symlinks, %d hardlinks, %d bytes (old data still on disk under .place/; delete when you're satisfied)",
+		stats.Files, stats.Dirs, stats.Symlinks, stats.Hardlinks, stats.Bytes)
+}
+
+func dirExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
 }

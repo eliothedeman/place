@@ -24,14 +24,42 @@ import (
 	"github.com/eliothedeman/place/lib/store"
 )
 
+// candidateLegacyDBs returns the conventional DB locations the legacy
+// binary or its test suite has used. The first one that exists wins.
+func candidateLegacyDBs(oldHot string) []string {
+	return []string{
+		filepath.Join(oldHot, ".place.db"),         // cmd/place default
+		filepath.Join(oldHot, ".place", "meta.db"), // audit_tests layout
+	}
+}
+
+// FindLegacyDB returns the path of an existing legacy DB under oldHot if
+// one is recognised, plus its found-or-not status. Useful for callers that
+// want to log "looked here and here, didn't find one."
+func FindLegacyDB(oldHot string) (path string, found bool) {
+	if oldHot == "" {
+		return "", false
+	}
+	for _, p := range candidateLegacyDBs(oldHot) {
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// LegacyDBCandidates returns the paths that FindLegacyDB checks, in order.
+// Exposed so the placefs binary can log what it looked at when no legacy
+// DB was found.
+func LegacyDBCandidates(oldHot string) []string {
+	return candidateLegacyDBs(oldHot)
+}
+
 // LooksLikeOldFormat reports whether oldHot appears to be an old-format
-// place hot root (a `.place.db` file plus a `.place/segments` directory).
+// place hot root: a recognised legacy DB plus the .place/segments dir.
 // Returns false for empty / unrelated directories.
 func LooksLikeOldFormat(oldHot string) bool {
-	if oldHot == "" {
-		return false
-	}
-	if _, err := os.Stat(filepath.Join(oldHot, ".place.db")); err != nil {
+	if _, ok := FindLegacyDB(oldHot); !ok {
 		return false
 	}
 	if st, err := os.Stat(filepath.Join(oldHot, ".place", "segments")); err != nil || !st.IsDir() {
@@ -81,11 +109,16 @@ func Run(dst *store.Store, opts Options) (Stats, error) {
 	}
 	dbPath := opts.OldDB
 	if dbPath == "" {
-		dbPath = filepath.Join(opts.OldHot, ".place.db")
+		if p, ok := FindLegacyDB(opts.OldHot); ok {
+			dbPath = p
+		} else {
+			dbPath = filepath.Join(opts.OldHot, ".place.db") // for the error message
+		}
 	}
 	if _, err := os.Stat(dbPath); err != nil {
 		return Stats{}, fmt.Errorf("migrate: old DB %s: %w", dbPath, err)
 	}
+	logf("using old DB at %s", dbPath)
 
 	oldMeta, err := oldplace.NewMeta(dbPath)
 	if err != nil {
