@@ -151,14 +151,24 @@ func (s *Segment) Append(h RecordHeader, payload []byte) (payloadOff int64, err 
 	return payloadOff, nil
 }
 
-// Sync fsyncs the file.
+// Sync fsyncs the file. Intentionally does NOT hold s.mu — fsync is the
+// slow part of the write path (5–20 ms typical) and serializing all
+// callers behind one fsync turns concurrent appends into a queue. The
+// kernel safely handles concurrent fsync(fd) from many threads; if one
+// fsync is in flight when another arrives, the second one finds the
+// dirty pages already being flushed and returns when they're done.
+//
+// The unsynchronised f.Sync() call races against Close(), which sets s.f
+// to nil under s.mu. We accept that race: Close is only called from set
+// teardown paths (GC.Remove, set.CloseAll) which the caller is
+// responsible for serialising against in-flight Append/Sync. A nil
+// dereference here would mean caller bug, not a concurrency hazard.
 func (s *Segment) Sync() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.f == nil {
+	f := s.f
+	if f == nil {
 		return nil
 	}
-	return s.f.Sync()
+	return f.Sync()
 }
 
 // Close closes the file descriptor.

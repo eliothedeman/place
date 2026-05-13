@@ -86,12 +86,19 @@ type Index struct {
 	hot  *segment.Set
 	cold *segment.Set
 
-	// writeMu serializes Append and Move at the index level so they can
-	// safely interleave bbolt updates with segment IO without holding the
-	// bbolt write lock across all of it. Bbolt's own writer-lock would also
-	// serialize, but we prefer to keep our segment writes outside any
-	// bbolt tx so that a slow fsync doesn't block read txs.
-	writeMu sync.Mutex
+	// writeMu coordinates appends vs structural mutations.
+	//
+	//   - Append takes RLock: many appends run concurrently (different
+	//     stripes are fully independent; same-stripe seq collisions are
+	//     handled in the bbolt-side re-read, see appendChunk).
+	//   - Move / Truncate / DeleteInode / BulkSession.Commit take Lock:
+	//     they need exclusive access because they snapshot fragment
+	//     state and assume nothing changes underneath them.
+	//
+	// Concurrent appends are essential for FUSE throughput: clients like
+	// qbittorrent issue many simultaneous writes from different connections,
+	// and a single Mutex turns them into a serial queue waiting on fsync.
+	writeMu sync.RWMutex
 }
 
 // Open creates or opens the index on the given hot/cold directories.
@@ -271,11 +278,16 @@ func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier 
 }
 
 func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, payload []byte, tier Tier) error {
-	idx.writeMu.Lock()
-	defer idx.writeMu.Unlock()
+	// RLock: many appends run concurrently — different stripes never
+	// conflict and same-stripe seq collisions are resolved in the bbolt
+	// re-read below. Move / Truncate / DeleteInode take the WLock and
+	// thus block all appends for the duration of their atomic swap.
+	idx.writeMu.RLock()
+	defer idx.writeMu.RUnlock()
 
 	// Pre-flight: pick a seq one greater than anything currently in the
-	// stripe. Read-only tx is cheap.
+	// stripe. Read-only tx is cheap. This value is optimistic — the bbolt
+	// Batch below re-reads and bumps if a concurrent appender raced.
 	var nextSeq uint64 = 1
 	err := idx.db.View(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketStripes).Get(stripeKey(inode, stripeID))
@@ -290,7 +302,9 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		return err
 	}
 
-	// Write the payload to the active segment of the target tier + fsync.
+	// Write the payload to the active segment of the target tier, then fsync.
+	// Sync no longer holds segment.mu, so concurrent appenders' fsyncs
+	// collapse in the kernel (one set of dirty pages, one disk barrier).
 	set := idx.setFor(tier)
 	seg, err := set.Active(segment.FramedSize(len(payload)))
 	if err != nil {
@@ -310,10 +324,17 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		return err
 	}
 
-	// Commit the fragment to bbolt. If another caller raced us between the
-	// View tx above and now, our nextSeq might collide. Resolve by re-reading
-	// inside the Update tx and bumping if needed — fragments are immutable
-	// so the only collision-risk is the seq number itself.
+	// Commit the fragment to bbolt. db.Batch (vs db.Update) coalesces
+	// concurrent callers into a single transaction with a single fsync,
+	// which is the second big throughput win — without it every append
+	// pays its own bbolt fsync (~5–15 ms on consumer SSDs).
+	//
+	// Batch may invoke fn more than once if a previous batch failed, so
+	// the fn must be idempotent. We achieve that by keying off the
+	// (SegmentID, SegmentOffset, Tier) tuple, which uniquely identifies
+	// the on-disk record: if a fragment with the same locator already
+	// exists, we skip the append. The optimistic Seq we passed in may be
+	// stale, so we always pick max(existing) + 1 inside the tx.
 	frag := Fragment{
 		Seq:           nextSeq,
 		LogicalOff:    logicalOff,
@@ -322,15 +343,20 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		SegmentID:     seg.ID(),
 		SegmentOffset: payloadOff,
 	}
-	return idx.db.Update(func(tx *bolt.Tx) error {
+	return idx.db.Batch(func(tx *bolt.Tx) error {
 		sb := tx.Bucket(bucketStripes)
 		key := stripeKey(inode, stripeID)
 		existing := decodeFragments(sb.Get(key))
+		var maxSeq uint64
 		for _, f := range existing {
-			if f.Seq >= frag.Seq {
-				frag.Seq = f.Seq + 1
+			if f.SegmentID == frag.SegmentID && f.SegmentOffset == frag.SegmentOffset && f.Tier == frag.Tier {
+				return nil // already committed by a prior Batch invocation
+			}
+			if f.Seq > maxSeq {
+				maxSeq = f.Seq
 			}
 		}
+		frag.Seq = maxSeq + 1
 		existing = append(existing, frag)
 		return sb.Put(key, encodeFragments(existing))
 	})
