@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/eliothedeman/place/lib/segment"
@@ -650,7 +652,14 @@ func (idx *Index) GC() error {
 			referenced[s.Tier()][id] = true
 		}
 	}
-	// Remove unreferenced segments.
+	// Remove unreferenced segments. Two passes per tier:
+	//   1. Iterate the in-memory set and Remove() any id with no live ref.
+	//      This drops the fd and unlinks the .seg file.
+	//   2. Walk the segments dir on disk for stray .seg files that aren't
+	//      in our in-memory set at all — i.e. files that appeared between
+	//      OpenSet and now (operator dropped a file, crash recovery left a
+	//      partially-flushed segment, etc.). Unlink any whose id isn't
+	//      referenced.
 	for _, s := range []*segment.Set{idx.hot, idx.cold} {
 		refs := referenced[s.Tier()]
 		for _, id := range s.All() {
@@ -658,6 +667,30 @@ func (idx *Index) GC() error {
 				if err := s.Remove(id); err != nil {
 					return err
 				}
+			}
+		}
+		entries, err := os.ReadDir(s.Dir())
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".seg") {
+				continue
+			}
+			base := strings.TrimSuffix(e.Name(), ".seg")
+			id64, perr := strconv.ParseUint(base, 10, 32)
+			if perr != nil {
+				continue
+			}
+			id := uint32(id64)
+			if refs[id] || s.Get(id) != nil {
+				continue
+			}
+			if err := os.Remove(filepath.Join(s.Dir(), e.Name())); err != nil && !os.IsNotExist(err) {
+				return err
 			}
 		}
 	}

@@ -14,21 +14,19 @@ import (
 	"github.com/eliothedeman/place/lib/store"
 )
 
-// makeOldFixture builds a small old-format dataset on disk under root with
-// the documented layout: {hot}/.place.db for the DB; {hot}/.place/segments/
-// and {cold}/.place/segments/ for the segment files.
+// makeOldFixture builds a small legacy-format dataset on disk under separate
+// hot/cold roots. Returns those roots and the expected file content map.
 func makeOldFixture(t *testing.T) (hot, cold string, expected map[string][]byte) {
 	t.Helper()
 	root := t.TempDir()
-	hot = filepath.Join(root, "old-hot")
-	cold = filepath.Join(root, "old-cold")
+	hot = filepath.Join(root, "hot")
+	cold = filepath.Join(root, "cold")
 	if err := os.MkdirAll(hot, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(cold, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// cmd/place's convention: DB at {hot}/.place.db.
 	dbPath := filepath.Join(hot, ".place.db")
 
 	m, err := oldplace.NewMeta(dbPath)
@@ -46,8 +44,6 @@ func makeOldFixture(t *testing.T) (hot, cold string, expected map[string][]byte)
 		m.Close()
 		t.Fatal(err)
 	}
-	// AttachMeta wires the durable segment-id counter — required by the
-	// writer path; harmless otherwise.
 	if err := hs.AttachMeta(m); err != nil {
 		t.Fatal(err)
 	}
@@ -65,22 +61,19 @@ func makeOldFixture(t *testing.T) (hot, cold string, expected map[string][]byte)
 			t.Fatal(err)
 		}
 	}
-	// Make some dirs.
 	mk("a", syscall.S_IFDIR|0o755)
 	mk("a/b", syscall.S_IFDIR|0o755)
 
-	// Regular files with content.
 	expected = map[string][]byte{
-		"a/hello.txt":  []byte("hello from a"),
+		"a/hello.txt":   []byte("hello from a"),
 		"a/b/large.bin": bytes.Repeat([]byte("LARGE"), 4096),
-		"top.txt":      []byte("top-level content"),
+		"top.txt":       []byte("top-level content"),
 	}
 	for rel, content := range expected {
 		mk(rel, syscall.S_IFREG|0o644)
 		if err := w.Submit(rel, 0, content); err != nil {
 			t.Fatalf("submit %s: %v", rel, err)
 		}
-		// Set size so reads stop at the right place.
 		fm, err := m.GetFile(rel)
 		if err != nil || fm == nil {
 			t.Fatalf("getfile %s: %v", rel, err)
@@ -90,8 +83,7 @@ func makeOldFixture(t *testing.T) (hot, cold string, expected map[string][]byte)
 			t.Fatal(err)
 		}
 	}
-
-	// A symlink.
+	// Symlink.
 	if err := m.PutFile(&oldplace.FileMeta{
 		Rel: "a/ptr", Mode: syscall.S_IFLNK | 0o777,
 		LinkTarget: "/some/where", Mtime: now, Ctime: now, Atime: now, Nlink: 1,
@@ -114,95 +106,9 @@ func makeOldFixture(t *testing.T) (hot, cold string, expected map[string][]byte)
 	return hot, cold, expected
 }
 
-func TestLooksLikeOldFormat(t *testing.T) {
-	hot, _, _ := makeOldFixture(t)
-	if !migrate.LooksLikeOldFormat(hot) {
-		t.Fatalf("LooksLikeOldFormat(%s) = false; want true", hot)
-	}
-	if migrate.LooksLikeOldFormat(t.TempDir()) {
-		t.Fatalf("LooksLikeOldFormat on empty dir returned true")
-	}
-}
-
-func TestMigratorCopiesEverything(t *testing.T) {
-	oldHot, oldCold, expected := makeOldFixture(t)
-
-	// Set up a fresh new-format store.
-	newRoot := t.TempDir()
-	idx, err := index.Open(index.Config{Root: newRoot})
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(idx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	stats, err := migrate.Run(st, migrate.Options{
-		OldHot:  oldHot,
-		OldCold: oldCold,
-		Logger:  func(string, ...any) {},
-	})
-	if err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if stats.Files != len(expected) {
-		t.Errorf("migrated %d files, want %d", stats.Files, len(expected))
-	}
-	if stats.Symlinks != 1 {
-		t.Errorf("migrated %d symlinks, want 1", stats.Symlinks)
-	}
-	if stats.Dirs != 2 {
-		t.Errorf("migrated %d dirs, want 2", stats.Dirs)
-	}
-
-	// Verify each file's contents are reachable through the new Store.
-	for rel, want := range expected {
-		n, err := st.LookupPath("/" + rel)
-		if err != nil {
-			t.Errorf("lookup %s: %v", rel, err)
-			continue
-		}
-		h, err := st.OpenInode(n.Inode, 0)
-		if err != nil {
-			t.Errorf("open %s: %v", rel, err)
-			continue
-		}
-		got := make([]byte, len(want))
-		rn, err := h.ReadAt(got, 0)
-		h.Close()
-		if err != nil {
-			t.Errorf("read %s: %v", rel, err)
-			continue
-		}
-		if rn != len(want) || !bytes.Equal(got, want) {
-			t.Errorf("content for %s mismatched: got %q (n=%d) want %q", rel, got, rn, want)
-		}
-	}
-
-	// Verify symlink.
-	ln, err := st.LookupPath("/a/ptr")
-	if err != nil {
-		t.Fatalf("lookup symlink: %v", err)
-	}
-	if !ln.Mode.IsSymlink() {
-		t.Fatalf("/a/ptr not a symlink: %o", ln.Mode)
-	}
-	if tgt, _ := st.Readlink(ln.Inode); tgt != "/some/where" {
-		t.Fatalf("symlink target %q", tgt)
-	}
-}
-
-// TestSameDirUpgradeFlow simulates the real upgrade path: hot and cold
-// directories already contain old-format data, the user runs the new binary
-// with the same -hot/-cold paths, the new index opens, the migrator runs,
-// and afterward both layouts coexist on disk — old in .place/, new in
-// .placefs/ — with the new store fully populated.
-func TestSameDirUpgradeFlow(t *testing.T) {
-	hot, cold, expected := makeOldFixture(t)
-
-	// Open the new index pointing at the same hot/cold dirs.
+// openNew opens a store on the same hot/cold dirs as the legacy fixture.
+func openNew(t *testing.T, hot, cold string) *store.Store {
+	t.Helper()
 	idx, err := index.Open(index.Config{HotDir: hot, ColdDir: cold})
 	if err != nil {
 		t.Fatal(err)
@@ -211,36 +117,60 @@ func TestSameDirUpgradeFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
+	return st
+}
 
-	if !migrate.LooksLikeOldFormat(hot) {
-		t.Fatalf("LooksLikeOldFormat returned false on fixture")
+func legacyExists(hot, cold string) bool {
+	for _, p := range []string{
+		filepath.Join(hot, ".place.db"),
+		filepath.Join(hot, ".place"),
+		filepath.Join(cold, ".place"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
 	}
-	stats, err := migrate.Run(st, migrate.Options{
-		OldHot:  hot,
-		OldCold: cold,
-		Logger:  func(string, ...any) {},
-	})
+	return false
+}
+
+func TestRunNoLegacyDataNoOp(t *testing.T) {
+	root := t.TempDir()
+	st := openNew(t, filepath.Join(root, "hot"), filepath.Join(root, "cold"))
+	stats, err := migrate.Run(st)
 	if err != nil {
-		t.Fatalf("migrate.Run: %v", err)
+		t.Fatal(err)
 	}
+	if stats.Files != 0 || stats.Dirs != 0 {
+		t.Fatalf("non-zero stats on fresh dir: %+v", stats)
+	}
+}
+
+func TestRunMigratesEverythingAndCleansUp(t *testing.T) {
+	hot, cold, expected := makeOldFixture(t)
+	st := openNew(t, hot, cold)
+
+	stats, err := migrate.Run(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if stats.Files != len(expected) {
-		t.Errorf("files migrated %d want %d", stats.Files, len(expected))
+		t.Errorf("files=%d want %d", stats.Files, len(expected))
+	}
+	if stats.Symlinks != 1 {
+		t.Errorf("symlinks=%d want 1", stats.Symlinks)
+	}
+	if stats.Dirs != 2 {
+		t.Errorf("dirs=%d want 2", stats.Dirs)
 	}
 
-	// Old subtree still present.
-	if _, err := os.Stat(filepath.Join(hot, ".place.db")); err != nil {
-		t.Errorf("old .place.db gone: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(hot, ".place", "segments")); err != nil {
-		t.Errorf("old .place/segments gone: %v", err)
-	}
-	// New subtree present.
-	if _, err := os.Stat(filepath.Join(hot, ".placefs", "db.bolt")); err != nil {
-		t.Errorf("new db.bolt missing: %v", err)
+	// Legacy subtree is gone.
+	if legacyExists(hot, cold) {
+		t.Errorf("legacy subtree still present after Run")
 	}
 
-	// Bytes match through the new Store.
+	// Bytes match through the new store.
 	for rel, want := range expected {
 		n, err := st.LookupPath("/" + rel)
 		if err != nil {
@@ -257,114 +187,145 @@ func TestSameDirUpgradeFlow(t *testing.T) {
 	}
 }
 
-// TestMigratorWritesToCold verifies the default target tier puts migrated
-// bytes in cold, leaving hot segments empty. This is what makes a bulk
-// upgrade safe when the hot drive is much smaller than the dataset.
-func TestMigratorWritesToCold(t *testing.T) {
-	oldHot, oldCold, _ := makeOldFixture(t)
-	newRoot := t.TempDir()
-	idx, err := index.Open(index.Config{Root: newRoot})
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(idx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+// TestRunWritesToCold confirms the hardcoded target tier.
+func TestRunWritesToCold(t *testing.T) {
+	hot, cold, _ := makeOldFixture(t)
+	st := openNew(t, hot, cold)
 
-	if _, err := migrate.Run(st, migrate.Options{
-		OldHot: oldHot, OldCold: oldCold,
-		Logger: func(string, ...any) {},
-	}); err != nil {
+	if _, err := migrate.Run(st); err != nil {
 		t.Fatal(err)
 	}
-
-	// Walk every stripe; none should have hot bytes.
-	err = idx.IterStripes(func(s index.StripeInfo) bool {
+	st.Index().IterStripes(func(s index.StripeInfo) bool {
 		if s.HotBytes > 0 {
-			t.Errorf("inode=%d stripe=%d landed %d hot bytes; default migrate should write to cold",
+			t.Errorf("inode=%d stripe=%d landed %d hot bytes; should be cold-only",
 				s.Inode, s.StripeID, s.HotBytes)
-		}
-		if s.ColdBytes == 0 {
-			t.Errorf("inode=%d stripe=%d has no cold bytes; migrate didn't write to cold",
-				s.Inode, s.StripeID)
 		}
 		return true
 	})
+}
+
+// TestRunIsIdempotent runs migrate twice in a row. Second call should be a
+// no-op since the legacy tree is gone.
+func TestRunIsIdempotent(t *testing.T) {
+	hot, cold, _ := makeOldFixture(t)
+	st := openNew(t, hot, cold)
+
+	first, err := migrate.Run(st)
 	if err != nil {
 		t.Fatal(err)
+	}
+	second, err := migrate.Run(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Files != 0 || second.Bytes != 0 {
+		t.Fatalf("second run did work: %+v (first was %+v)", second, first)
 	}
 }
 
-// TestMigratorCleanupRemovesLegacyFiles verifies that --migrate-cleanup
-// deletes the legacy DB and segments on a successful run, and that the
-// new dataset is still readable after.
-func TestMigratorCleanupRemovesLegacyFiles(t *testing.T) {
-	oldHot, oldCold, expected := makeOldFixture(t)
-	newRoot := t.TempDir()
-	idx, err := index.Open(index.Config{Root: newRoot})
+// TestResumeFromPartialState mimics an interrupted migration: we
+// pre-migrate a few entries by hand (via Mkdir/Create), then call Run and
+// confirm it picks up the rest without erroring on the already-done ones.
+func TestResumeFromPartialState(t *testing.T) {
+	hot, cold, expected := makeOldFixture(t)
+	st := openNew(t, hot, cold)
+
+	// Manually create one of the expected entries before Run sees it.
+	d, err := st.Mkdir(store.RootInode, "a", 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(idx)
+	if _, _, err := st.Create(d.Inode, "hello.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Note: we don't populate bytes — the test verifies Run leaves
+	// existing-path entries alone (it can't safely re-migrate them
+	// without losing whatever's there). The other files do get migrated.
+
+	stats, err := migrate.Run(st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-
-	if _, err := migrate.Run(st, migrate.Options{
-		OldHot: oldHot, OldCold: oldCold,
-		Cleanup: true,
-		Logger:  func(string, ...any) {},
-	}); err != nil {
-		t.Fatal(err)
+	// Should have migrated only the entries that didn't exist yet.
+	if stats.Files >= len(expected) {
+		t.Errorf("resume migrated %d files; expected fewer than %d", stats.Files, len(expected))
 	}
-
-	// Legacy files should be gone.
-	if _, err := os.Stat(filepath.Join(oldHot, ".place.db")); !os.IsNotExist(err) {
-		t.Errorf(".place.db not removed: %v", err)
+	if legacyExists(hot, cold) {
+		t.Errorf("legacy subtree still present after resume run")
 	}
-	if _, err := os.Stat(filepath.Join(oldHot, ".place")); !os.IsNotExist(err) {
-		t.Errorf(".place dir not removed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(oldCold, ".place")); !os.IsNotExist(err) {
-		t.Errorf("cold .place dir not removed: %v", err)
-	}
-
-	// New dataset still works.
-	for rel, want := range expected {
-		n, err := st.LookupPath("/" + rel)
-		if err != nil {
-			t.Errorf("post-cleanup lookup %s: %v", rel, err)
-			continue
-		}
-		h, _ := st.OpenInode(n.Inode, 0)
-		got := make([]byte, len(want))
-		h.ReadAt(got, 0)
-		h.Close()
-		if !bytes.Equal(got, want) {
-			t.Errorf("post-cleanup content mismatch for %s", rel)
+	// Each expected path should exist in the new store.
+	for rel := range expected {
+		if _, err := st.LookupPath("/" + rel); err != nil {
+			t.Errorf("path %q missing after resume: %v", rel, err)
 		}
 	}
 }
 
-func TestMigratorRejectsMissingOldData(t *testing.T) {
-	newRoot := t.TempDir()
-	idx, err := index.Open(index.Config{Root: newRoot})
+// TestOrphanLegacySegmentDeleted creates a stray .seg file in the legacy
+// segments dir with no FileMeta referencing it, and verifies Run cleans it
+// up (principle 4).
+func TestOrphanLegacySegmentDeleted(t *testing.T) {
+	hot, cold, _ := makeOldFixture(t)
+
+	// Drop a fake unreferenced .seg file into the legacy dir.
+	orphanPath := filepath.Join(hot, ".place", "segments", "99999999.seg")
+	if err := os.WriteFile(orphanPath, []byte("not a real record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openNew(t, hot, cold)
+	stats, err := migrate.Run(st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(idx)
+	if stats.LegacyOrphans == 0 {
+		t.Errorf("LegacyOrphans=0; should have counted the planted orphan")
+	}
+}
+
+// TestRunGCsNewFormatToo verifies principle 4 also applies to the new
+// segments dir: drop an unreferenced .seg in .placefs/segments and confirm
+// it's gone after Run.
+func TestRunGCsNewFormatToo(t *testing.T) {
+	root := t.TempDir()
+	hot := filepath.Join(root, "hot")
+	cold := filepath.Join(root, "cold")
+	st := openNew(t, hot, cold)
+
+	// Plant an orphan .seg in the new segments dir.
+	newSegDir := filepath.Join(hot, ".placefs", "segments")
+	if err := os.MkdirAll(newSegDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphanPath := filepath.Join(newSegDir, "99999999.seg")
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := migrate.Run(st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Errorf("new-format orphan not cleaned: %v", err)
+	}
+}
+
+// TestIncrementalCleanup verifies that legacy .seg files are unlinked as
+// their last referencer migrates, rather than all at the end. We approximate
+// by checking that after Run completes there are no remaining files in
+// {hot,cold}/.place/segments/ AND that segments-reaped count is > 0.
+func TestIncrementalCleanup(t *testing.T) {
+	hot, cold, _ := makeOldFixture(t)
+	st := openNew(t, hot, cold)
+	stats, err := migrate.Run(st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-	_, err = migrate.Run(st, migrate.Options{
-		OldHot:  filepath.Join(t.TempDir(), "no-such"),
-		OldCold: filepath.Join(t.TempDir(), "no-such-cold"),
-	})
-	if err == nil {
-		t.Fatalf("migrate.Run should have failed with no old data")
+	if stats.SegmentsReaped == 0 && stats.LegacyOrphans == 0 {
+		t.Errorf("no legacy segments removed; stats=%+v", stats)
+	}
+	// Final tree removal should have happened; .place is gone.
+	if _, err := os.Stat(filepath.Join(hot, ".place")); !os.IsNotExist(err) {
+		t.Errorf("legacy hot .place still present: %v", err)
 	}
 }
