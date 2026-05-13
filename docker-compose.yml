@@ -53,9 +53,25 @@ services:
     # Extra placefs flags go here. Hot/cold/mount paths are wired up by
     # docker-entrypoint.sh, so do NOT pass --hot/--cold/--mount.
     #
+    # The only flags you really need to set are --hot-max-bytes and
+    # --hot-target-bytes. Without those, the mover never evicts and
+    # the hot drive will eventually fill up. Pick a cap that fits your
+    # hot drive minus headroom for live writes.
+    #
     # command:
-    #   - --hot-max-bytes=2147483648     # 2 GiB cap on hot tier
-    #   - --hot-target-bytes=1610612736  # 1.5 GiB post-evict target
-    #   - --tick=10s                     # mover poll interval
-    #   - --admin-addr=:9090             # /metrics /healthz endpoint (default :9090)
-    #   - --shutdown-grace=30s           # SIGTERM patience before exit(1)
+    #   - --hot-max-bytes=10737418240    # 10 GiB cap on hot tier
+    #   - --hot-target-bytes=8589934592  # 8 GiB post-evict target
+    #
+    #   # Optional: structured logs for aggregators (Loki, Datadog, etc).
+    #   - --log-format=json
+    #   # - --log-level=debug            # flip to debug when diagnosing
+    #
+    #   # Optional: mover poll interval (default 30s).
+    #   # - --tick=10s
+    #
+    #   # Optional: enable /debug/pprof on :9090 when actively debugging.
+    #   # Leave off — pprof leaks goroutine names + heap data.
+    #   # - --debug-pprof
+    #
+    #   # Optional: FUSE ops slower than this log at debug level (default 1s).
+    #   # - --slow-op-threshold=500ms
