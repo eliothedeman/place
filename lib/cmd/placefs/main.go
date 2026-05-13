@@ -50,6 +50,8 @@ func main() {
 	slowOpThreshold := flag.Duration("slow-op-threshold", 1*time.Second, "FUSE operations slower than this log at debug level (0 disables)")
 	allowOther := flag.Bool("allow-other", true, "let users other than the mounter access the FUSE mount (-o allow_other). Required when sharing the mount with other containers/users.")
 	defaultPermissions := flag.Bool("default-permissions", true, "have the kernel enforce node mode/owner permission checks (-o default_permissions). Standard POSIX behaviour.")
+	maxWrite := bytesValue(1 << 20)
+	flag.Var(&maxWrite, "fuse-max-write", "max bytes per FUSE write request. Default is 1MiB; bumping past the FUSE default of 64KiB dramatically reduces per-write overhead for sequential writers like torrent clients.")
 	flag.Parse()
 
 	logger, err := makeLogger(*logLevel, *logFormat)
@@ -133,6 +135,7 @@ func main() {
 		Name:       "placefs",
 		FsName:     "placefs",
 		AllowOther: *allowOther,
+		MaxWrite:   int(maxWrite),
 	}
 	if *defaultPermissions {
 		mountOpts.Options = append(mountOpts.Options, "default_permissions")
