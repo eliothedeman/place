@@ -52,6 +52,7 @@ func main() {
 	defaultPermissions := flag.Bool("default-permissions", true, "have the kernel enforce node mode/owner permission checks (-o default_permissions). Standard POSIX behaviour.")
 	maxWrite := bytesValue(1 << 20)
 	flag.Var(&maxWrite, "fuse-max-write", "max bytes per FUSE write request. Default is 1MiB; bumping past the FUSE default of 64KiB dramatically reduces per-write overhead for sequential writers like torrent clients.")
+	writebackCache := flag.Bool("writeback-cache", true, "enable the kernel's FUSE writeback cache (CAP_WRITEBACK_CACHE). The kernel buffers and coalesces writes into MaxWrite-sized batches, dramatically reducing the number of FUSE round-trips for sequential writers. Turn off only if you suspect this is hiding a bug.")
 	flag.Parse()
 
 	logger, err := makeLogger(*logLevel, *logFormat)
@@ -139,6 +140,14 @@ func main() {
 	}
 	if *defaultPermissions {
 		mountOpts.Options = append(mountOpts.Options, "default_permissions")
+	}
+	if *writebackCache {
+		// CAP_WRITEBACK_CACHE makes the kernel batch user writes into
+		// MaxWrite-sized async chunks instead of forwarding every write(2)
+		// syscall as its own FUSE request. For sequential writers (torrent
+		// clients, video downloaders) this is typically the difference
+		// between "tens of MB/s" and "saturate the disk".
+		mountOpts.ExtraCapabilities |= fuse.CAP_WRITEBACK_CACHE
 	}
 	opts := &fs.Options{MountOptions: mountOpts}
 	root := fuselayer.NewRoot(st, fuselayer.Options{
