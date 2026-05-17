@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eliothedeman/place/obs"
 	"github.com/eliothedeman/place/segment"
@@ -140,10 +141,30 @@ func Open(cfg Config) (*Index, error) {
 	if cfg.DBPath == "" {
 		cfg.DBPath = filepath.Join(hotSubdir, "db.bolt")
 	}
-	db, err := bolt.Open(cfg.DBPath, 0o600, nil)
+	// FreelistType = MapType: the default ArrayType is O(N) in the number
+	// of free pages, which gets pathological for DBs that churn pages
+	// (every stripe rewrite frees old leaves). MapType is O(log N) and
+	// makes a much bigger difference than the docs imply once the DB has
+	// been running for a while.
+	//
+	// NoFreelistSync = true: bbolt's commit normally fsyncs the freelist
+	// page tree separately from the data pages. With NoFreelistSync the
+	// freelist is reconstructed at next Open by scanning the DB — adds
+	// a few hundred ms to startup on a multi-GB DB but removes one fsync
+	// per write tx, which is the win that matters under load.
+	dbOpts := *bolt.DefaultOptions
+	dbOpts.FreelistType = bolt.FreelistMapType
+	dbOpts.NoFreelistSync = true
+	db, err := bolt.Open(cfg.DBPath, 0o600, &dbOpts)
 	if err != nil {
 		return nil, err
 	}
+	// Default MaxBatchDelay is 10 ms — a deterministic floor on every
+	// db.Batch call when no other goroutine joins the batch. With one
+	// or two concurrent FUSE writers we sit at that floor on every
+	// fragment commit. 2 ms still gives concurrent callers a window to
+	// coalesce without dominating per-write latency.
+	db.MaxBatchDelay = 2 * time.Millisecond
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{bucketMeta, bucketStripes} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
@@ -273,8 +294,31 @@ func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier 
 
 // AppendToCtx is the ctx-aware variant of AppendTo. See AppendTo.
 func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte, tier Tier) error {
+	return idx.AppendToWithTxCtx(ctx, inode, logicalOff, payload, tier, nil)
+}
+
+// AppendToWithTxCtx is AppendToCtx + an optional txHook that runs inside
+// the same bbolt write tx that commits the fragments. The hook lets a
+// caller (today: store.WriteAtTierCtx) fold an unrelated bucket update
+// — e.g. bumping the file's Size/Mtime — into the same fsync, halving
+// the bbolt commit count per logical write.
+//
+// All chunks of one call are committed in a single batch. Previously
+// each chunk paid its own db.Batch (with its own MaxBatchDelay floor
+// and its own copy-on-write page churn); a multi-stripe write therefore
+// paid N commits when one would do.
+//
+// The hook MUST be idempotent: db.Batch may invoke fn more than once
+// if a previous batch in the group failed. Same caveat that already
+// applied to the fragment-commit fn.
+func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte, tier Tier, txHook func(*bolt.Tx) error) error {
 	if len(payload) == 0 {
-		return nil
+		if txHook == nil {
+			return nil
+		}
+		// Empty write with a hook still has to land the hook (e.g. an
+		// mtime-only update). One tiny batch — cheap.
+		return idx.db.Batch(txHook)
 	}
 	ctx, span := obs.Tracer().Start(ctx, "index.append")
 	span.SetAttributes(
@@ -285,6 +329,24 @@ func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int6
 	)
 	defer span.End()
 
+	// Hold writeMu.RLock for the whole call: every chunk's segment write
+	// happens under the same reader-section, and the single bbolt batch
+	// below also runs under it. Move/Truncate/DeleteInode are the only
+	// things that take the writer lock; they block all of this.
+	lockCtx, lockSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
+	idx.writeMu.RLock()
+	lockSpan.End()
+	_ = lockCtx
+	defer idx.writeMu.RUnlock()
+
+	// Stage every chunk: write to segment + fsync, build a pending
+	// fragment record. We do not touch bbolt yet — that's all in the
+	// single batch below.
+	type pending struct {
+		stripeID uint32
+		frag     Fragment
+	}
+	var pendings []pending
 	rem := payload
 	off := logicalOff
 	for len(rem) > 0 {
@@ -294,137 +356,113 @@ func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int6
 		if off+chunkLen > stripeEnd {
 			chunkLen = stripeEnd - off
 		}
-		if err := idx.appendChunk(ctx, inode, stripeID, off, rem[:chunkLen], tier); err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+		chunk := rem[:chunkLen]
+
+		set := idx.setFor(tier)
+		_, activeSpan := obs.Tracer().Start(ctx, "segment.active")
+		seg, err := set.Active(segment.FramedSize(len(chunk)))
+		activeSpan.End()
+		if err != nil {
+			recordSpanError(span, err)
 			return err
 		}
+		// Seq=0 in the on-disk header: the bbolt-side Seq is assigned
+		// inside the batch below. The on-disk Seq is only consulted by
+		// the catastrophic-rebuild path; reads always come from bbolt.
+		_, appSpan := obs.Tracer().Start(ctx, "segment.append")
+		appSpan.SetAttributes(attribute.Int("bytes", len(chunk)))
+		payloadOff, err := seg.Append(segment.RecordHeader{
+			Inode:      inode,
+			StripeID:   stripeID,
+			Seq:        0,
+			LogicalOff: off,
+			Length:     uint32(len(chunk)),
+		}, chunk)
+		appSpan.End()
+		if err != nil {
+			recordSpanError(span, err)
+			return err
+		}
+		// segment.sync is the fsync(2) on the segment file — typically the
+		// single biggest contributor to per-write latency on SSD/NVMe (the
+		// device flushes its write cache + ext4/xfs writes a journal
+		// barrier). Concurrent appenders' fsyncs collapse in the kernel,
+		// so we don't hold any lock across this.
+		_, syncSpan := obs.Tracer().Start(ctx, "segment.sync")
+		err = seg.Sync()
+		syncSpan.End()
+		if err != nil {
+			recordSpanError(span, err)
+			return err
+		}
+
+		pendings = append(pendings, pending{
+			stripeID: stripeID,
+			frag: Fragment{
+				LogicalOff:    off,
+				Length:        chunkLen,
+				Tier:          tier,
+				SegmentID:     seg.ID(),
+				SegmentOffset: payloadOff,
+				// Seq filled in inside the batch
+			},
+		})
 		rem = rem[chunkLen:]
 		off += chunkLen
 	}
-	return nil
-}
 
-func (idx *Index) appendChunk(ctx context.Context, inode uint64, stripeID uint32, logicalOff int64, payload []byte, tier Tier) error {
-	ctx, span := obs.Tracer().Start(ctx, "index.append_chunk")
-	span.SetAttributes(
-		attribute.Int64("inode", int64(inode)),
-		attribute.Int64("stripe_id", int64(stripeID)),
-		attribute.Int64("logical_off", logicalOff),
-		attribute.Int("payload_bytes", len(payload)),
-		attribute.String("tier", tier.String()),
-	)
-	defer span.End()
-
-	// RLock: many appends run concurrently — different stripes never
-	// conflict and same-stripe seq collisions are resolved in the bbolt
-	// re-read below. Move / Truncate / DeleteInode take the WLock and
-	// thus block all appends for the duration of their atomic swap.
+	// One batch commits every fragment + the optional hook. db.Batch
+	// coalesces with concurrent goroutines doing their own AppendTo;
+	// the per-call cost is one tx fsync regardless of chunk count.
 	//
-	// Trace it: lock contention against a Move/Truncate is one of the
-	// suspects when sequential appends slow down.
-	lockCtx, lockSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
-	idx.writeMu.RLock()
-	lockSpan.End()
-	_ = lockCtx
-	defer idx.writeMu.RUnlock()
-
-	// Pre-flight: pick a seq one greater than anything currently in the
-	// stripe. Read-only tx is cheap. This value is optimistic — the bbolt
-	// Batch below re-reads and bumps if a concurrent appender raced.
-	var nextSeq uint64 = 1
-	preCtx, preSpan := obs.Tracer().Start(ctx, "index.seq_preflight")
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketStripes).Get(stripeKey(inode, stripeID))
-		for _, f := range decodeFragments(v) {
-			if f.Seq >= nextSeq {
-				nextSeq = f.Seq + 1
+	// Idempotency: Batch may call fn more than once if an earlier batch
+	// in the group failed. The fragment write is keyed by
+	// (Tier, SegmentID, SegmentOffset) — if a matching fragment already
+	// exists we skip it. The txHook must enforce its own idempotency.
+	_, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
+	batchSpan.SetAttributes(attribute.Int("fragments", len(pendings)))
+	err := idx.db.Batch(func(tx *bolt.Tx) error {
+		sb := tx.Bucket(bucketStripes)
+		// Group fragments by stripe so we read+write each stripe's blob
+		// only once even if multiple chunks landed in the same stripe
+		// (rare in practice — chunks split at stripe boundaries — but
+		// possible if a future caller passes a sub-stripe payload).
+		byStripe := map[uint32][]Fragment{}
+		for _, p := range pendings {
+			byStripe[p.stripeID] = append(byStripe[p.stripeID], p.frag)
+		}
+		for stripeID, frags := range byStripe {
+			key := stripeKey(inode, stripeID)
+			existing := decodeFragments(sb.Get(key))
+			var maxSeq uint64
+			for _, f := range existing {
+				if f.Seq > maxSeq {
+					maxSeq = f.Seq
+				}
 			}
+			for i := range frags {
+				skip := false
+				for _, e := range existing {
+					if e.Tier == frags[i].Tier && e.SegmentID == frags[i].SegmentID && e.SegmentOffset == frags[i].SegmentOffset {
+						skip = true
+						break
+					}
+				}
+				if skip {
+					continue
+				}
+				maxSeq++
+				frags[i].Seq = maxSeq
+				existing = append(existing, frags[i])
+			}
+			if err := sb.Put(key, encodeFragments(existing)); err != nil {
+				return err
+			}
+		}
+		if txHook != nil {
+			return txHook(tx)
 		}
 		return nil
-	})
-	preSpan.End()
-	_ = preCtx
-	if err != nil {
-		recordSpanError(span, err)
-		return err
-	}
-
-	// Write the payload to the active segment of the target tier, then fsync.
-	// Sync no longer holds segment.mu, so concurrent appenders' fsyncs
-	// collapse in the kernel (one set of dirty pages, one disk barrier).
-	set := idx.setFor(tier)
-	_, activeSpan := obs.Tracer().Start(ctx, "segment.active")
-	seg, err := set.Active(segment.FramedSize(len(payload)))
-	activeSpan.End()
-	if err != nil {
-		recordSpanError(span, err)
-		return err
-	}
-	_, appSpan := obs.Tracer().Start(ctx, "segment.append")
-	appSpan.SetAttributes(attribute.Int("bytes", len(payload)))
-	payloadOff, err := seg.Append(segment.RecordHeader{
-		Inode:      inode,
-		StripeID:   stripeID,
-		Seq:        nextSeq,
-		LogicalOff: logicalOff,
-		Length:     uint32(len(payload)),
-	}, payload)
-	appSpan.End()
-	if err != nil {
-		recordSpanError(span, err)
-		return err
-	}
-	// segment.sync is the fsync(2) on the segment file — typically the
-	// single biggest contributor to per-write latency on SSD/NVMe (the
-	// device flushes its write cache + ext4/xfs writes a journal barrier).
-	// If this span dominates the trace, the bottleneck is fsync, not
-	// userspace work, and the relevant knobs are batching/coalescing on
-	// the write side or weaker durability on the filesystem side.
-	_, syncSpan := obs.Tracer().Start(ctx, "segment.sync")
-	err = seg.Sync()
-	syncSpan.End()
-	if err != nil {
-		recordSpanError(span, err)
-		return err
-	}
-
-	// Commit the fragment to bbolt. db.Batch (vs db.Update) coalesces
-	// concurrent callers into a single transaction with a single fsync,
-	// which is the second big throughput win — without it every append
-	// pays its own bbolt fsync (~5–15 ms on consumer SSDs).
-	//
-	// Batch may invoke fn more than once if a previous batch failed, so
-	// the fn must be idempotent. We achieve that by keying off the
-	// (SegmentID, SegmentOffset, Tier) tuple, which uniquely identifies
-	// the on-disk record: if a fragment with the same locator already
-	// exists, we skip the append. The optimistic Seq we passed in may be
-	// stale, so we always pick max(existing) + 1 inside the tx.
-	frag := Fragment{
-		Seq:           nextSeq,
-		LogicalOff:    logicalOff,
-		Length:        int64(len(payload)),
-		Tier:          tier,
-		SegmentID:     seg.ID(),
-		SegmentOffset: payloadOff,
-	}
-	_, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
-	err = idx.db.Batch(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		key := stripeKey(inode, stripeID)
-		existing := decodeFragments(sb.Get(key))
-		var maxSeq uint64
-		for _, f := range existing {
-			if f.SegmentID == frag.SegmentID && f.SegmentOffset == frag.SegmentOffset && f.Tier == frag.Tier {
-				return nil // already committed by a prior Batch invocation
-			}
-			if f.Seq > maxSeq {
-				maxSeq = f.Seq
-			}
-		}
-		frag.Seq = maxSeq + 1
-		existing = append(existing, frag)
-		return sb.Put(key, encodeFragments(existing))
 	})
 	batchSpan.End()
 	if err != nil {

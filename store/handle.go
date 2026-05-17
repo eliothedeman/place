@@ -98,6 +98,10 @@ func (h *Handle) WriteAtTier(p []byte, off int64, tier index.Tier) (int, error) 
 // WriteAtTierCtx is the ctx-aware variant of WriteAtTier. This is the
 // canonical write path for the FUSE adapter; the non-ctx wrappers exist
 // for tests + the migrator.
+//
+// The fragment commit and the node Size/Mtime update share a single
+// bbolt write tx via index.AppendToWithTxCtx — one fsync per FUSE
+// write instead of two.
 func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier index.Tier) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -111,18 +115,14 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 	)
 	defer span.End()
 
-	if err := h.store.idx.AppendToCtx(ctx, h.inode, off, p, tier); err != nil {
-		recordHandleSpanError(span, err)
-		return 0, err
-	}
 	end := off + int64(len(p))
 	now := time.Now().UnixNano()
-	// Node-size bump runs in its own bbolt write tx — separate from the
-	// segment fsync + fragment commit done by AppendTo. On a hot write
-	// workload this tx fsyncs the bbolt file again, so it shows up as a
-	// distinct contributor to per-write latency in the trace.
-	_, nodeSpan := obs.Tracer().Start(ctx, "store.update_node")
-	err := h.store.db.Update(func(tx *bolt.Tx) error {
+	// nodeUpdate runs inside index's batch tx. It is idempotent: setting
+	// Size = max(Size, end) and Mtime = now produces the same result on
+	// a Batch retry. (Mtime "moves backward by a few µs across a retry"
+	// would be a non-issue and isn't actually possible since `now` is
+	// captured before the batch starts.)
+	nodeUpdate := func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketNodes).Get(inodeKey(h.inode))
 		if v == nil {
 			return fmt.Errorf("store: write to inode %d with no node entry", h.inode)
@@ -137,9 +137,8 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 		n.Mtime = now
 		n.Ctime = now
 		return tx.Bucket(bucketNodes).Put(inodeKey(h.inode), encodeNode(n))
-	})
-	nodeSpan.End()
-	if err != nil {
+	}
+	if err := h.store.idx.AppendToWithTxCtx(ctx, h.inode, off, p, tier, nodeUpdate); err != nil {
 		recordHandleSpanError(span, err)
 		return 0, err
 	}
