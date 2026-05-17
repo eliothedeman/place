@@ -239,6 +239,23 @@ func callerCreds(ctx context.Context) (uint32, uint32) {
 	return 0, 0
 }
 
+// stampCallerAttrs annotates the current span with the FUSE caller's
+// uid/gid/pid pulled from ctx. Cheap (no-op when not running in a real
+// FUSE request, e.g. tests) and makes traces grep-able by client
+// process — useful when something like qbittorrent is on one inode and
+// a syncthing scan is on another.
+func stampCallerAttrs(ctx context.Context) {
+	c, ok := fuse.FromContext(ctx)
+	if !ok {
+		return
+	}
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.Int64("caller.uid", int64(c.Uid)),
+		attribute.Int64("caller.gid", int64(c.Gid)),
+		attribute.Int64("caller.pid", int64(c.Pid)),
+	)
+}
+
 var _ fs.NodeOpener = (*node)(nil)
 
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -269,7 +286,9 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 	var res fuse.ReadResult
 	var resErrno syscall.Errno
 	h.root.trackOp(ctx, "read", func(ctx context.Context) syscall.Errno {
+		stampCallerAttrs(ctx)
 		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int64("inode", int64(h.h.Inode())),
 			attribute.Int("bytes", len(dest)),
 			attribute.Int64("off", off),
 		)
@@ -290,7 +309,9 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	var written uint32
 	var resErrno syscall.Errno
 	h.root.trackOp(ctx, "write", func(ctx context.Context) syscall.Errno {
+		stampCallerAttrs(ctx)
 		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int64("inode", int64(h.h.Inode())),
 			attribute.Int("bytes", len(data)),
 			attribute.Int64("off", off),
 		)
@@ -317,6 +338,8 @@ var _ fs.FileFsyncer = (*handle)(nil)
 
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	return h.root.trackOp(ctx, "fsync", func(ctx context.Context) syscall.Errno {
+		stampCallerAttrs(ctx)
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("inode", int64(h.h.Inode())))
 		return errno(h.h.SyncCtx(ctx))
 	})
 }

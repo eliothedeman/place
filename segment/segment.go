@@ -9,6 +9,7 @@
 package segment
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -19,6 +20,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/eliothedeman/place/obs"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Tier names which kind of storage a Set lives on. The byte value is durable
@@ -107,10 +111,25 @@ func (s *Segment) ReadAt(p []byte, off int64) (int, error) {
 // the absolute byte offset of the payload within the segment, which the
 // caller embeds into a Locator. h.Length must equal len(payload).
 func (s *Segment) Append(h RecordHeader, payload []byte) (payloadOff int64, err error) {
+	return s.AppendCtx(context.Background(), h, payload)
+}
+
+// AppendCtx is the ctx-aware variant of Append. Three child spans hang
+// off ctx: segment.frame (memcopy + CRC), segment.acquire_mu (lock-wait
+// time — > 0 means another appender to this segment was ahead of us),
+// and segment.pwrite (the kernel write). They tell you, at a glance,
+// which of "CPU framing", "lock contention", or "page-cache stall" is
+// dominating segment.append.
+func (s *Segment) AppendCtx(ctx context.Context, h RecordHeader, payload []byte) (payloadOff int64, err error) {
 	if int(h.Length) != len(payload) {
 		return 0, fmt.Errorf("segment: header length %d != payload %d", h.Length, len(payload))
 	}
 	total := headerSize + len(payload) + trailerSize
+
+	// Framing + CRC. Pure CPU; on a 1 MiB payload the CRC alone is
+	// typically the largest single contributor here (hardware-CRC32c
+	// would be faster but stdlib uses CRC32-IEEE).
+	_, frameSpan := obs.Tracer().Start(ctx, "segment.frame")
 	buf := make([]byte, total)
 	o := 0
 	binary.LittleEndian.PutUint32(buf[o:], recordMagic)
@@ -136,10 +155,23 @@ func (s *Segment) Append(h RecordHeader, payload []byte) (payloadOff int64, err 
 	o += len(payload)
 	crc := crc32.ChecksumIEEE(buf[4:o]) // skip magic; cover version..payload
 	binary.LittleEndian.PutUint32(buf[o:], crc)
+	frameSpan.End()
 
+	// Lock acquisition. Times the wait, not the hold.
+	_, lockSpan := obs.Tracer().Start(ctx, "segment.acquire_mu")
 	s.mu.Lock()
+	lockSpan.End()
 	defer s.mu.Unlock()
+
+	// The write itself — page-cache or device-stalled.
+	_, writeSpan := obs.Tracer().Start(ctx, "segment.pwrite")
+	writeSpan.SetAttributes(
+		attribute.Int64("segment_id", int64(s.id)),
+		attribute.Int("bytes", total),
+		attribute.Int64("offset", s.size),
+	)
 	n, err := s.f.Write(buf)
+	writeSpan.End()
 	if err != nil {
 		return 0, err
 	}
@@ -164,6 +196,19 @@ func (s *Segment) Append(h RecordHeader, payload []byte) (payloadOff int64, err 
 // responsible for serialising against in-flight Append/Sync. A nil
 // dereference here would mean caller bug, not a concurrency hazard.
 func (s *Segment) Sync() error {
+	return s.SyncCtx(context.Background())
+}
+
+// SyncCtx is the ctx-aware variant of Sync. The active segment-id and
+// (approximate) file size are stamped on the span so the trace shows
+// how much was queued behind this fsync.
+func (s *Segment) SyncCtx(ctx context.Context) error {
+	_, span := obs.Tracer().Start(ctx, "segment.sync")
+	span.SetAttributes(
+		attribute.Int64("segment_id", int64(s.id)),
+		attribute.Int64("segment_size", s.Size()),
+	)
+	defer span.End()
 	f := s.f
 	if f == nil {
 		return nil
@@ -328,6 +373,19 @@ func (s *Set) Dir() string { return s.dir }
 // after crash and the next process would think the rotated-out bytes
 // were the last word — corrupting any new appends made just before crash.
 func (s *Set) Active(recordSize int64) (*Segment, error) {
+	return s.ActiveCtx(context.Background(), recordSize)
+}
+
+// ActiveCtx is the ctx-aware variant of Active. The hot path (no
+// rotation) just stamps `rotated=false` on the span. The slow path
+// (rotation) emits sub-spans for the outgoing-segment Sync, the new
+// openSegment, and the parent-dir fsync — three steps that each cost
+// an fsync barrier so it's worth seeing them individually when a write
+// happens to coincide with a rotation.
+func (s *Set) ActiveCtx(ctx context.Context, recordSize int64) (*Segment, error) {
+	ctx, span := obs.Tracer().Start(ctx, "segment.active")
+	defer span.End()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active != nil {
@@ -335,26 +393,40 @@ func (s *Set) Active(recordSize int64) (*Segment, error) {
 		fits := s.active.size+recordSize <= s.maxSize
 		s.active.mu.Unlock()
 		if fits {
+			span.SetAttributes(
+				attribute.Bool("rotated", false),
+				attribute.Int64("segment_id", int64(s.active.id)),
+			)
 			return s.active, nil
 		}
 	}
+	span.SetAttributes(attribute.Bool("rotated", true))
 	if s.active != nil {
-		if err := s.active.Sync(); err != nil {
+		_, syncSpan := obs.Tracer().Start(ctx, "segment.rotate.sync_outgoing")
+		err := s.active.Sync()
+		syncSpan.End()
+		if err != nil {
 			return nil, err
 		}
 	}
 	id := s.nextID
 	s.nextID++
+	_, openSpan := obs.Tracer().Start(ctx, "segment.rotate.open")
 	seg, err := openSegment(filepath.Join(s.dir, segFileName(id)), id)
+	openSpan.End()
 	if err != nil {
 		return nil, err
 	}
-	if err := fsyncDir(s.dir); err != nil {
+	_, dirSpan := obs.Tracer().Start(ctx, "segment.rotate.fsync_dir")
+	err = fsyncDir(s.dir)
+	dirSpan.End()
+	if err != nil {
 		seg.Close()
 		return nil, fmt.Errorf("segment: fsync rotation dir: %w", err)
 	}
 	s.segments[id] = seg
 	s.active = seg
+	span.SetAttributes(attribute.Int64("segment_id", int64(id)))
 	return seg, nil
 }
 

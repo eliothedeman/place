@@ -326,6 +326,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		attribute.Int64("logical_off", logicalOff),
 		attribute.Int("payload_bytes", len(payload)),
 		attribute.String("tier", tier.String()),
+		attribute.Bool("has_tx_hook", txHook != nil),
 	)
 	defer span.End()
 
@@ -333,11 +334,20 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	// happens under the same reader-section, and the single bbolt batch
 	// below also runs under it. Move/Truncate/DeleteInode are the only
 	// things that take the writer lock; they block all of this.
-	lockCtx, lockSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
+	_, acqSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
 	idx.writeMu.RLock()
-	lockSpan.End()
-	_ = lockCtx
-	defer idx.writeMu.RUnlock()
+	acqSpan.End()
+	// write_lock_held times the hold, not the wait. If a Move/Truncate
+	// is queued behind us, you'll see acqSpan ~0 µs and held = total work
+	// — which is the normal case. If the Move/Truncate ran first, acqSpan
+	// shows the wait. Together they distinguish "we waited" from "they
+	// waited on us."
+	heldCtx, heldSpan := obs.Tracer().Start(ctx, "index.write_lock_held")
+	defer func() {
+		heldSpan.End()
+		idx.writeMu.RUnlock()
+	}()
+	ctx = heldCtx
 
 	// Stage every chunk: write to segment + fsync, build a pending
 	// fragment record. We do not touch bbolt yet — that's all in the
@@ -349,6 +359,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	var pendings []pending
 	rem := payload
 	off := logicalOff
+	chunkIdx := 0
 	for len(rem) > 0 {
 		stripeID := idx.stripeOf(off)
 		stripeEnd := (int64(stripeID) + 1) * idx.stripeSize
@@ -359,9 +370,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		chunk := rem[:chunkLen]
 
 		set := idx.setFor(tier)
-		_, activeSpan := obs.Tracer().Start(ctx, "segment.active")
-		seg, err := set.Active(segment.FramedSize(len(chunk)))
-		activeSpan.End()
+		seg, err := set.ActiveCtx(ctx, segment.FramedSize(len(chunk)))
 		if err != nil {
 			recordSpanError(span, err)
 			return err
@@ -369,9 +378,13 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		// Seq=0 in the on-disk header: the bbolt-side Seq is assigned
 		// inside the batch below. The on-disk Seq is only consulted by
 		// the catastrophic-rebuild path; reads always come from bbolt.
-		_, appSpan := obs.Tracer().Start(ctx, "segment.append")
-		appSpan.SetAttributes(attribute.Int("bytes", len(chunk)))
-		payloadOff, err := seg.Append(segment.RecordHeader{
+		appCtx, appSpan := obs.Tracer().Start(ctx, "segment.append")
+		appSpan.SetAttributes(
+			attribute.Int("bytes", len(chunk)),
+			attribute.Int("chunk_idx", chunkIdx),
+			attribute.Int64("segment_id", int64(seg.ID())),
+		)
+		payloadOff, err := seg.AppendCtx(appCtx, segment.RecordHeader{
 			Inode:      inode,
 			StripeID:   stripeID,
 			Seq:        0,
@@ -388,10 +401,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		// device flushes its write cache + ext4/xfs writes a journal
 		// barrier). Concurrent appenders' fsyncs collapse in the kernel,
 		// so we don't hold any lock across this.
-		_, syncSpan := obs.Tracer().Start(ctx, "segment.sync")
-		err = seg.Sync()
-		syncSpan.End()
-		if err != nil {
+		if err := seg.SyncCtx(ctx); err != nil {
 			recordSpanError(span, err)
 			return err
 		}
@@ -409,7 +419,9 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		})
 		rem = rem[chunkLen:]
 		off += chunkLen
+		chunkIdx++
 	}
+	span.SetAttributes(attribute.Int("chunks", chunkIdx))
 
 	// One batch commits every fragment + the optional hook. db.Batch
 	// coalesces with concurrent goroutines doing their own AppendTo;
@@ -419,9 +431,32 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	// in the group failed. The fragment write is keyed by
 	// (Tier, SegmentID, SegmentOffset) — if a matching fragment already
 	// exists we skip it. The txHook must enforce its own idempotency.
-	_, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
+	batchCtx, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
 	batchSpan.SetAttributes(attribute.Int("fragments", len(pendings)))
 	err := idx.db.Batch(func(tx *bolt.Tx) error {
+		// batch_fn is the time spent in our work (decode/encode/Put + hook).
+		// bbolt.batch - bbolt.batch_fn is everything bbolt itself does:
+		// MaxBatchDelay wait, mmap remap, freelist serialise, two fsyncs
+		// (data + meta). On this hardware the gap is the bbolt overhead
+		// that no userspace tuning can shrink.
+		_, fnSpan := obs.Tracer().Start(batchCtx, "bbolt.batch_fn")
+		// Snapshot tx stats at the end of the fn so we know the page
+		// churn this commit will fsync. These are the numbers that
+		// dictate bbolt commit cost — split/spill count and page-alloc
+		// bytes are the most useful at a glance.
+		defer func() {
+			st := tx.Stats()
+			fnSpan.SetAttributes(
+				attribute.Int64("bbolt.page_count", st.GetPageCount()),
+				attribute.Int64("bbolt.page_alloc", st.GetPageAlloc()),
+				attribute.Int64("bbolt.cursor_count", st.GetCursorCount()),
+				attribute.Int64("bbolt.node_count", st.GetNodeCount()),
+				attribute.Int64("bbolt.split", st.GetSplit()),
+				attribute.Int64("bbolt.spill", st.GetSpill()),
+				attribute.Int64("bbolt.rebalance", st.GetRebalance()),
+			)
+			fnSpan.End()
+		}()
 		sb := tx.Bucket(bucketStripes)
 		// Group fragments by stripe so we read+write each stripe's blob
 		// only once even if multiple chunks landed in the same stripe
