@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/segment"
 )
 
 // Config controls the background mover.

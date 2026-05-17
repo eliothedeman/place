@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/segment"
 )
 
 // TestConcurrentAppendsToSameStripeAreOrdered verifies that many

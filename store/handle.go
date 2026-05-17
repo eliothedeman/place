@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/eliothedeman/place/lib/index"
+	"github.com/eliothedeman/place/index"
 	bolt "go.etcd.io/bbolt"
 )
 

@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/segment"
 	bolt "go.etcd.io/bbolt"
 )
 

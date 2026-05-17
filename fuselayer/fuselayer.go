@@ -1,5 +1,5 @@
 // Package fuselayer is the L5 kernel-protocol adapter. It translates go-fuse
-// callbacks to lib/store calls. There should be no business logic here —
+// callbacks to store calls. There should be no business logic here —
 // every method is a one-shot translation. If you find yourself reaching for
 // the index or a segment directly, fix the layering instead.
 //
@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/eliothedeman/place/lib/store"
+	"github.com/eliothedeman/place/store"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -74,14 +74,17 @@ func (r *root) trackOp(name string, fn func() syscall.Errno) syscall.Errno {
 		return fn()
 	}
 	start := time.Now()
-	e := fn()
-	d := time.Since(start)
-	if r.opts.Metrics != nil {
-		r.opts.Metrics.Observe(name, d, e != 0)
-	}
-	if r.opts.SlowOpThreshold > 0 && d >= r.opts.SlowOpThreshold {
-		r.opts.Logger.Debug("slow fuse op", "op", name, "duration", d, "errno", int(e))
-	}
+	var e syscall.Errno
+	defer func() {
+		d := time.Since(start)
+		if r.opts.Metrics != nil {
+			r.opts.Metrics.Observe(name, d, e != 0)
+		}
+		if r.opts.SlowOpThreshold > 0 && d >= r.opts.SlowOpThreshold {
+			r.opts.Logger.Debug("slow fuse op", "op", name, "duration", d, "errno", int(e))
+		}
+	}()
+	e = fn()
 	return e
 }
 

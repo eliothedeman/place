@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/eliothedeman/place/lib/admin"
-	"github.com/eliothedeman/place/lib/fuselayer"
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/mover"
-	"github.com/eliothedeman/place/lib/store"
+	"github.com/eliothedeman/place/admin"
+	"github.com/eliothedeman/place/fuselayer"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/mover"
+	"github.com/eliothedeman/place/store"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )

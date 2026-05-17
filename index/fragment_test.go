@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/segment"
 )
 
 func TestPlanReadDisjoint(t *testing.T) {

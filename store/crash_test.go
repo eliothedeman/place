@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/index"
+	"github.com/eliothedeman/place/index"
 )
 
 // TestSetattrTruncateAtomicity exercises the "fragments first, size last"

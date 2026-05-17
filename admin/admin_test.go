@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/eliothedeman/place/lib/fuselayer"
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/mover"
+	"github.com/eliothedeman/place/fuselayer"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/mover"
 )
 
 func freePort(t *testing.T) string {

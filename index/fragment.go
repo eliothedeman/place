@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/segment"
 )
 
 // A Fragment names a contiguous run of bytes in a file's logical range, with

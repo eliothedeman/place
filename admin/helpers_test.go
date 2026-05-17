@@ -3,7 +3,7 @@ package admin
 import (
 	"time"
 
-	"github.com/eliothedeman/place/lib/fuselayer"
+	"github.com/eliothedeman/place/fuselayer"
 )
 
 // stampOps records a small canned set of op observations so /metrics

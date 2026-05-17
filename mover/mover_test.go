@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/segment"
 )
 
 func TestEvictMovesHotStripesToCold(t *testing.T) {

@@ -7,9 +7,9 @@ import (
 	mathrand "math/rand"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/mover"
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/mover"
+	"github.com/eliothedeman/place/segment"
 )
 
 // Alias the tier constant for terser test code.

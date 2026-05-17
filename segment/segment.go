@@ -4,7 +4,7 @@
 // self-describing data (inode, stripe, seq, logical_off) that the L2 index
 // could be rebuilt from segment scans if it were ever lost.
 //
-// Only L2 (the lib/index package) should import this. Higher layers must not
+// Only L2 (the index package) should import this. Higher layers must not
 // reach in here.
 package segment
 

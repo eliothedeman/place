@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/segment"
 )
 
 func newIndex(t *testing.T) *Index {

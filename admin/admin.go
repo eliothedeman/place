@@ -26,10 +26,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/eliothedeman/place/lib/fuselayer"
-	"github.com/eliothedeman/place/lib/index"
-	"github.com/eliothedeman/place/lib/mover"
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/fuselayer"
+	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/mover"
+	"github.com/eliothedeman/place/segment"
 )
 
 // Deps is the dependency bundle the admin server reads from.

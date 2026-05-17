@@ -7,7 +7,7 @@
 //   - the GC primitive that drops segments with no live references.
 //
 // The index has no concept of paths, modes, or directory trees. Build those
-// at L4 (the lib/store package) on top.
+// at L4 (the store package) on top.
 package index
 
 import (
@@ -22,12 +22,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/eliothedeman/place/lib/segment"
+	"github.com/eliothedeman/place/segment"
 	bolt "go.etcd.io/bbolt"
 )
 
 // Tier and Locator are re-exported from L1 for convenience; higher layers
-// should reference these names rather than reaching into lib/segment.
+// should reference these names rather than reaching into segment.
 type Tier = segment.Tier
 type Locator = segment.Locator
 

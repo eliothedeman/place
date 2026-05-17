@@ -6,7 +6,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/eliothedeman/place/lib/index"
+	"github.com/eliothedeman/place/index"
 )
 
 func newStore(t *testing.T) *Store {
