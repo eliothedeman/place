@@ -19,6 +19,7 @@ import (
 	"github.com/eliothedeman/place/fuselayer"
 	"github.com/eliothedeman/place/index"
 	"github.com/eliothedeman/place/mover"
+	"github.com/eliothedeman/place/obs"
 	"github.com/eliothedeman/place/store"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -53,6 +54,17 @@ func main() {
 	maxWrite := bytesValue(1 << 20)
 	flag.Var(&maxWrite, "fuse-max-write", "max bytes per FUSE write request. Default is 1MiB; bumping past the FUSE default of 64KiB dramatically reduces per-write overhead for sequential writers like torrent clients.")
 	writebackCache := flag.Bool("writeback-cache", true, "enable the kernel's FUSE writeback cache (CAP_WRITEBACK_CACHE). The kernel buffers and coalesces writes into MaxWrite-sized batches, dramatically reducing the number of FUSE round-trips for sequential writers. Turn off only if you suspect this is hiding a bug.")
+
+	// OpenTelemetry tracing. Empty endpoint = disabled. Set to a Jaeger
+	// OTLP endpoint (Jaeger >=v1.35 accepts OTLP natively on :4318) or
+	// any other OTLP/HTTP receiver to enable. Trace overhead is roughly
+	// proportional to sample-ratio × FUSE-write-rate; ratios above ~0.01
+	// can themselves slow the write path on hot workloads.
+	otelEndpoint := flag.String("otel-endpoint", "", "OTLP/HTTP receiver, e.g. http://jaeger:4318. Empty disables tracing.")
+	otelServiceName := flag.String("otel-service-name", "placefs", "service.name attribute on emitted spans.")
+	otelServiceVersion := flag.String("otel-service-version", "", "Optional service.version attribute on emitted spans (e.g. a git SHA).")
+	otelSampleRatio := flag.Float64("otel-sample-ratio", 0.01, "Head-based trace sampling probability in [0,1]. 1=record everything (heavy under write load), 0=record nothing. Crank to 1.0 only when actively debugging.")
+	otelInsecure := flag.Bool("otel-insecure", false, "When --otel-endpoint uses https://, downgrade to plaintext. Bare host:port and http:// are already plaintext.")
 	flag.Parse()
 
 	logger, err := makeLogger(*logLevel, *logFormat)
@@ -67,6 +79,32 @@ func main() {
 		os.Exit(2)
 	}
 	logger.Info("starting", "hot", *hot, "cold", *cold, "mount", *mountPoint)
+
+	// Initialise tracing before opening any storage so spans cover the
+	// whole lifecycle including bbolt open + segment scan. shutdownTrace
+	// is a no-op when --otel-endpoint is empty.
+	shutdownTrace, err := obs.Init(context.Background(), obs.Config{
+		Endpoint:       *otelEndpoint,
+		ServiceName:    *otelServiceName,
+		ServiceVersion: *otelServiceVersion,
+		SampleRatio:    *otelSampleRatio,
+		Insecure:       *otelInsecure,
+	})
+	if err != nil {
+		logger.Error("otel init failed", "err", err)
+		os.Exit(1)
+	}
+	if *otelEndpoint != "" {
+		logger.Info("tracing enabled",
+			"endpoint", *otelEndpoint,
+			"service", *otelServiceName,
+			"sample_ratio", *otelSampleRatio)
+	}
+	defer func() {
+		if err := shutdownTrace(context.Background()); err != nil {
+			logger.Error("otel shutdown", "err", err)
+		}
+	}()
 	for _, p := range []string{*hot, *cold, *mountPoint} {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			logger.Error("mkdir failed", "path", p, "err", err)

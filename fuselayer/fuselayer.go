@@ -21,9 +21,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eliothedeman/place/obs"
 	"github.com/eliothedeman/place/store"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Options configures the FUSE root. Zero value is valid — defaults to no
@@ -65,26 +69,33 @@ type node struct {
 	inode uint64
 }
 
-// trackOp wraps an op, recording its duration + outcome in metrics, and
-// logging slow ops at debug. Pass a closure that returns the syscall.Errno.
-// The returned Errno is whatever the closure produced — trackOp is a
-// passthrough.
-func (r *root) trackOp(name string, fn func() syscall.Errno) syscall.Errno {
-	if r.opts.Metrics == nil && r.opts.SlowOpThreshold == 0 {
-		return fn()
-	}
+// trackOp wraps an op, recording its duration + outcome in metrics,
+// logging slow ops at debug, and starting an OpenTelemetry span named
+// "fuse.<op>" so the rest of the stack can hang child spans off it.
+// The closure receives the ctx with the span attached, returns the
+// syscall.Errno, and trackOp is otherwise a passthrough.
+func (r *root) trackOp(ctx context.Context, name string, fn func(context.Context) syscall.Errno) syscall.Errno {
+	// Start a span unconditionally — when no provider is configured this
+	// resolves to the noop tracer, which is a few-ns no-op. Routing
+	// through trackOp keeps the FUSE entry-point spans in one place
+	// instead of repeating the boilerplate per method.
+	ctx, span := obs.Tracer().Start(ctx, "fuse."+name, trace.WithSpanKind(trace.SpanKindServer))
+	defer span.End()
+
 	start := time.Now()
-	var e syscall.Errno
-	defer func() {
-		d := time.Since(start)
-		if r.opts.Metrics != nil {
-			r.opts.Metrics.Observe(name, d, e != 0)
-		}
-		if r.opts.SlowOpThreshold > 0 && d >= r.opts.SlowOpThreshold {
-			r.opts.Logger.Debug("slow fuse op", "op", name, "duration", d, "errno", int(e))
-		}
-	}()
-	e = fn()
+	e := fn(ctx)
+	d := time.Since(start)
+
+	if r.opts.Metrics != nil {
+		r.opts.Metrics.Observe(name, d, e != 0)
+	}
+	if e != 0 {
+		span.SetAttributes(attribute.Int("errno", int(e)))
+		span.SetStatus(codes.Error, e.Error())
+	}
+	if r.opts.SlowOpThreshold > 0 && d >= r.opts.SlowOpThreshold {
+		r.opts.Logger.Debug("slow fuse op", "op", name, "duration", d, "errno", int(e))
+	}
 	return e
 }
 
@@ -132,7 +143,7 @@ var _ fs.NodeLookuper = (*node)(nil)
 func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
-	n.root.trackOp("lookup", func() syscall.Errno {
+	n.root.trackOp(ctx, "lookup", func(ctx context.Context) syscall.Errno {
 		child, err := n.store.Lookup(n.inode, name)
 		if err != nil {
 			resErrno = errno(err)
@@ -148,7 +159,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 var _ fs.NodeGetattrer = (*node)(nil)
 
 func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	return n.root.trackOp("getattr", func() syscall.Errno {
+	return n.root.trackOp(ctx, "getattr", func(ctx context.Context) syscall.Errno {
 		nn, err := n.store.Stat(n.inode)
 		if err != nil {
 			return errno(err)
@@ -161,7 +172,7 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 var _ fs.NodeSetattrer = (*node)(nil)
 
 func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	return n.root.trackOp("setattr", func() syscall.Errno {
+	return n.root.trackOp(ctx, "setattr", func(ctx context.Context) syscall.Errno {
 		var sa store.SetAttr
 		if mode, ok := in.GetMode(); ok {
 			m := store.Mode(mode)
@@ -202,7 +213,7 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	var resInode *fs.Inode
 	var resFile fs.FileHandle
 	var resErrno syscall.Errno
-	n.root.trackOp("create", func() syscall.Errno {
+	n.root.trackOp(ctx, "create", func(ctx context.Context) syscall.Errno {
 		uid, gid := callerCreds(ctx)
 		nn, h, err := n.store.Create(n.inode, name, store.Mode(mode), uid, gid)
 		if err != nil {
@@ -233,7 +244,7 @@ var _ fs.NodeOpener = (*node)(nil)
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	var resFile fs.FileHandle
 	var resErrno syscall.Errno
-	n.root.trackOp("open", func() syscall.Errno {
+	n.root.trackOp(ctx, "open", func(ctx context.Context) syscall.Errno {
 		h, err := n.store.OpenInode(n.inode, int(flags))
 		if err != nil {
 			resErrno = errno(err)
@@ -257,8 +268,12 @@ var _ fs.FileReader = (*handle)(nil)
 func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	var res fuse.ReadResult
 	var resErrno syscall.Errno
-	h.root.trackOp("read", func() syscall.Errno {
-		n, err := h.h.ReadAt(dest, off)
+	h.root.trackOp(ctx, "read", func(ctx context.Context) syscall.Errno {
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int("bytes", len(dest)),
+			attribute.Int64("off", off),
+		)
+		n, err := h.h.ReadAtCtx(ctx, dest, off)
 		if err != nil {
 			resErrno = errno(err)
 			return resErrno
@@ -274,8 +289,12 @@ var _ fs.FileWriter = (*handle)(nil)
 func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	var written uint32
 	var resErrno syscall.Errno
-	h.root.trackOp("write", func() syscall.Errno {
-		n, err := h.h.WriteAt(data, off)
+	h.root.trackOp(ctx, "write", func(ctx context.Context) syscall.Errno {
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int("bytes", len(data)),
+			attribute.Int64("off", off),
+		)
+		n, err := h.h.WriteAtCtx(ctx, data, off)
 		if err != nil {
 			resErrno = errno(err)
 			return resErrno
@@ -297,15 +316,15 @@ func (h *handle) Flush(ctx context.Context) syscall.Errno {
 var _ fs.FileFsyncer = (*handle)(nil)
 
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return h.root.trackOp("fsync", func() syscall.Errno {
-		return errno(h.h.Sync())
+	return h.root.trackOp(ctx, "fsync", func(ctx context.Context) syscall.Errno {
+		return errno(h.h.SyncCtx(ctx))
 	})
 }
 
 var _ fs.FileReleaser = (*handle)(nil)
 
 func (h *handle) Release(ctx context.Context) syscall.Errno {
-	return h.root.trackOp("release", func() syscall.Errno {
+	return h.root.trackOp(ctx, "release", func(ctx context.Context) syscall.Errno {
 		return errno(h.h.Close())
 	})
 }
@@ -317,7 +336,7 @@ var _ fs.NodeMkdirer = (*node)(nil)
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
-	n.root.trackOp("mkdir", func() syscall.Errno {
+	n.root.trackOp(ctx, "mkdir", func(ctx context.Context) syscall.Errno {
 		uid, gid := callerCreds(ctx)
 		nn, err := n.store.Mkdir(n.inode, name, store.Mode(mode), uid, gid)
 		if err != nil {
@@ -334,7 +353,7 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 var _ fs.NodeUnlinker = (*node)(nil)
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
-	return n.root.trackOp("unlink", func() syscall.Errno {
+	return n.root.trackOp(ctx, "unlink", func(ctx context.Context) syscall.Errno {
 		return errno(n.store.Unlink(n.inode, name))
 	})
 }
@@ -342,7 +361,7 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 var _ fs.NodeRmdirer = (*node)(nil)
 
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
-	return n.root.trackOp("rmdir", func() syscall.Errno {
+	return n.root.trackOp(ctx, "rmdir", func(ctx context.Context) syscall.Errno {
 		return errno(n.store.Rmdir(n.inode, name))
 	})
 }
@@ -350,7 +369,7 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 var _ fs.NodeRenamer = (*node)(nil)
 
 func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	return n.root.trackOp("rename", func() syscall.Errno {
+	return n.root.trackOp(ctx, "rename", func(ctx context.Context) syscall.Errno {
 		np, ok := newParent.(*node)
 		if !ok {
 			return syscall.EINVAL
@@ -366,7 +385,7 @@ var _ fs.NodeSymlinker = (*node)(nil)
 func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
-	n.root.trackOp("symlink", func() syscall.Errno {
+	n.root.trackOp(ctx, "symlink", func(ctx context.Context) syscall.Errno {
 		uid, gid := callerCreds(ctx)
 		nn, err := n.store.Symlink(n.inode, name, target, uid, gid)
 		if err != nil {
@@ -385,7 +404,7 @@ var _ fs.NodeReadlinker = (*node)(nil)
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	var res []byte
 	var resErrno syscall.Errno
-	n.root.trackOp("readlink", func() syscall.Errno {
+	n.root.trackOp(ctx, "readlink", func(ctx context.Context) syscall.Errno {
 		t, err := n.store.Readlink(n.inode)
 		if err != nil {
 			resErrno = errno(err)
@@ -402,7 +421,7 @@ var _ fs.NodeLinker = (*node)(nil)
 func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var resInode *fs.Inode
 	var resErrno syscall.Errno
-	n.root.trackOp("link", func() syscall.Errno {
+	n.root.trackOp(ctx, "link", func(ctx context.Context) syscall.Errno {
 		tgt, ok := target.(*node)
 		if !ok {
 			resErrno = syscall.EINVAL
@@ -427,7 +446,7 @@ var _ fs.NodeReaddirer = (*node)(nil)
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	var resStream fs.DirStream
 	var resErrno syscall.Errno
-	n.root.trackOp("readdir", func() syscall.Errno {
+	n.root.trackOp(ctx, "readdir", func(ctx context.Context) syscall.Errno {
 		entries, err := n.store.Readdir(n.inode)
 		if err != nil {
 			resErrno = errno(err)
@@ -450,7 +469,7 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 var _ fs.NodeStatfser = (*node)(nil)
 
 func (n *node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
-	return n.root.trackOp("statfs", func() syscall.Errno {
+	return n.root.trackOp(ctx, "statfs", func(ctx context.Context) syscall.Errno {
 		st, err := n.store.Statfs()
 		if err != nil {
 			return errno(err)

@@ -12,6 +12,7 @@ package index
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,8 +23,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/eliothedeman/place/obs"
 	"github.com/eliothedeman/place/segment"
 	bolt "go.etcd.io/bbolt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Tier and Locator are re-exported from L1 for convenience; higher layers
@@ -242,7 +247,14 @@ func (idx *Index) setFor(tier Tier) *segment.Set {
 // tier. The write may be split into multiple per-stripe records if it
 // crosses a stripe boundary; each piece becomes one Fragment.
 func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
-	return idx.AppendTo(inode, logicalOff, payload, segment.TierHot)
+	return idx.AppendToCtx(context.Background(), inode, logicalOff, payload, segment.TierHot)
+}
+
+// AppendCtx is the ctx-aware variant of Append. Spans started inside the
+// call hang off ctx so a single FUSE write shows the full breakdown
+// (segment append + fsync + bbolt commit) in one trace.
+func (idx *Index) AppendCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte) error {
+	return idx.AppendToCtx(ctx, inode, logicalOff, payload, segment.TierHot)
 }
 
 // AppendTo is the same as Append but lets the caller pick which tier the
@@ -256,9 +268,23 @@ func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
 // become orphans and GC will reclaim them — the index never holds a
 // fragment pointing at non-durable bytes.
 func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier Tier) error {
+	return idx.AppendToCtx(context.Background(), inode, logicalOff, payload, tier)
+}
+
+// AppendToCtx is the ctx-aware variant of AppendTo. See AppendTo.
+func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte, tier Tier) error {
 	if len(payload) == 0 {
 		return nil
 	}
+	ctx, span := obs.Tracer().Start(ctx, "index.append")
+	span.SetAttributes(
+		attribute.Int64("inode", int64(inode)),
+		attribute.Int64("logical_off", logicalOff),
+		attribute.Int("payload_bytes", len(payload)),
+		attribute.String("tier", tier.String()),
+	)
+	defer span.End()
+
 	rem := payload
 	off := logicalOff
 	for len(rem) > 0 {
@@ -268,7 +294,9 @@ func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier 
 		if off+chunkLen > stripeEnd {
 			chunkLen = stripeEnd - off
 		}
-		if err := idx.appendChunk(inode, stripeID, off, rem[:chunkLen], tier); err != nil {
+		if err := idx.appendChunk(ctx, inode, stripeID, off, rem[:chunkLen], tier); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 		rem = rem[chunkLen:]
@@ -277,18 +305,35 @@ func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier 
 	return nil
 }
 
-func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, payload []byte, tier Tier) error {
+func (idx *Index) appendChunk(ctx context.Context, inode uint64, stripeID uint32, logicalOff int64, payload []byte, tier Tier) error {
+	ctx, span := obs.Tracer().Start(ctx, "index.append_chunk")
+	span.SetAttributes(
+		attribute.Int64("inode", int64(inode)),
+		attribute.Int64("stripe_id", int64(stripeID)),
+		attribute.Int64("logical_off", logicalOff),
+		attribute.Int("payload_bytes", len(payload)),
+		attribute.String("tier", tier.String()),
+	)
+	defer span.End()
+
 	// RLock: many appends run concurrently — different stripes never
 	// conflict and same-stripe seq collisions are resolved in the bbolt
 	// re-read below. Move / Truncate / DeleteInode take the WLock and
 	// thus block all appends for the duration of their atomic swap.
+	//
+	// Trace it: lock contention against a Move/Truncate is one of the
+	// suspects when sequential appends slow down.
+	lockCtx, lockSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
 	idx.writeMu.RLock()
+	lockSpan.End()
+	_ = lockCtx
 	defer idx.writeMu.RUnlock()
 
 	// Pre-flight: pick a seq one greater than anything currently in the
 	// stripe. Read-only tx is cheap. This value is optimistic — the bbolt
 	// Batch below re-reads and bumps if a concurrent appender raced.
 	var nextSeq uint64 = 1
+	preCtx, preSpan := obs.Tracer().Start(ctx, "index.seq_preflight")
 	err := idx.db.View(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketStripes).Get(stripeKey(inode, stripeID))
 		for _, f := range decodeFragments(v) {
@@ -298,7 +343,10 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		}
 		return nil
 	})
+	preSpan.End()
+	_ = preCtx
 	if err != nil {
+		recordSpanError(span, err)
 		return err
 	}
 
@@ -306,10 +354,15 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 	// Sync no longer holds segment.mu, so concurrent appenders' fsyncs
 	// collapse in the kernel (one set of dirty pages, one disk barrier).
 	set := idx.setFor(tier)
+	_, activeSpan := obs.Tracer().Start(ctx, "segment.active")
 	seg, err := set.Active(segment.FramedSize(len(payload)))
+	activeSpan.End()
 	if err != nil {
+		recordSpanError(span, err)
 		return err
 	}
+	_, appSpan := obs.Tracer().Start(ctx, "segment.append")
+	appSpan.SetAttributes(attribute.Int("bytes", len(payload)))
 	payloadOff, err := seg.Append(segment.RecordHeader{
 		Inode:      inode,
 		StripeID:   stripeID,
@@ -317,10 +370,22 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		LogicalOff: logicalOff,
 		Length:     uint32(len(payload)),
 	}, payload)
+	appSpan.End()
 	if err != nil {
+		recordSpanError(span, err)
 		return err
 	}
-	if err := seg.Sync(); err != nil {
+	// segment.sync is the fsync(2) on the segment file — typically the
+	// single biggest contributor to per-write latency on SSD/NVMe (the
+	// device flushes its write cache + ext4/xfs writes a journal barrier).
+	// If this span dominates the trace, the bottleneck is fsync, not
+	// userspace work, and the relevant knobs are batching/coalescing on
+	// the write side or weaker durability on the filesystem side.
+	_, syncSpan := obs.Tracer().Start(ctx, "segment.sync")
+	err = seg.Sync()
+	syncSpan.End()
+	if err != nil {
+		recordSpanError(span, err)
 		return err
 	}
 
@@ -343,7 +408,8 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		SegmentID:     seg.ID(),
 		SegmentOffset: payloadOff,
 	}
-	return idx.db.Batch(func(tx *bolt.Tx) error {
+	_, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
+	err = idx.db.Batch(func(tx *bolt.Tx) error {
 		sb := tx.Bucket(bucketStripes)
 		key := stripeKey(inode, stripeID)
 		existing := decodeFragments(sb.Get(key))
@@ -360,6 +426,22 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 		existing = append(existing, frag)
 		return sb.Put(key, encodeFragments(existing))
 	})
+	batchSpan.End()
+	if err != nil {
+		recordSpanError(span, err)
+	}
+	return err
+}
+
+// recordSpanError stamps span with the error code + message. Centralised
+// so every error path in this file looks identical and we don't accidentally
+// leave a span marked OK when something failed.
+func recordSpanError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 }
 
 // PlanRead returns the slices required to satisfy a read of [off, off+length)
@@ -367,9 +449,22 @@ func (idx *Index) appendChunk(inode uint64, stripeID uint32, logicalOff int64, p
 // Sparse marker (caller chooses how to fill — block, zero-fill, etc.).
 // Slices are sorted by logical offset and non-overlapping.
 func (idx *Index) PlanRead(inode uint64, off, length int64) ([]ReadSlice, error) {
+	return idx.PlanReadCtx(context.Background(), inode, off, length)
+}
+
+// PlanReadCtx is the ctx-aware variant of PlanRead.
+func (idx *Index) PlanReadCtx(ctx context.Context, inode uint64, off, length int64) ([]ReadSlice, error) {
 	if length <= 0 {
 		return nil, nil
 	}
+	_, span := obs.Tracer().Start(ctx, "index.plan_read")
+	span.SetAttributes(
+		attribute.Int64("inode", int64(inode)),
+		attribute.Int64("off", off),
+		attribute.Int64("length", length),
+	)
+	defer span.End()
+
 	first := idx.stripeOf(off)
 	last := idx.stripeOf(off + length - 1)
 	var allFrags []Fragment
@@ -385,23 +480,46 @@ func (idx *Index) PlanRead(inode uint64, off, length int64) ([]ReadSlice, error)
 		return nil
 	})
 	if err != nil {
+		recordSpanError(span, err)
 		return nil, err
 	}
-	return planRead(allFrags, off, length), nil
+	plan := planRead(allFrags, off, length)
+	span.SetAttributes(attribute.Int("slices", len(plan)))
+	return plan, nil
 }
 
 // ReadAt pulls bytes from disk for one Locator. Returns the number of bytes
 // read. Concurrent-safe.
 func (idx *Index) ReadAt(loc Locator, p []byte) (int, error) {
+	return idx.ReadAtCtx(context.Background(), loc, p)
+}
+
+// ReadAtCtx is the ctx-aware variant of ReadAt.
+func (idx *Index) ReadAtCtx(ctx context.Context, loc Locator, p []byte) (int, error) {
+	_, span := obs.Tracer().Start(ctx, "segment.read_at")
+	span.SetAttributes(
+		attribute.String("tier", loc.Tier.String()),
+		attribute.Int64("segment_id", int64(loc.SegmentID)),
+		attribute.Int64("offset", loc.Offset),
+		attribute.Int("bytes", len(p)),
+	)
+	defer span.End()
+
 	set := idx.setFor(loc.Tier)
 	seg := set.Get(loc.SegmentID)
 	if seg == nil {
-		return 0, fmt.Errorf("index: missing segment %d in %s", loc.SegmentID, loc.Tier)
+		err := fmt.Errorf("index: missing segment %d in %s", loc.SegmentID, loc.Tier)
+		recordSpanError(span, err)
+		return 0, err
 	}
 	if int64(len(p)) > loc.Length {
 		p = p[:loc.Length]
 	}
-	return seg.ReadAt(p, loc.Offset)
+	n, err := seg.ReadAt(p, loc.Offset)
+	if err != nil {
+		recordSpanError(span, err)
+	}
+	return n, err
 }
 
 // BulkSession is a write session that batches segment fsyncs and bbolt
@@ -898,13 +1016,26 @@ func (idx *Index) HotUsedBytes() int64 {
 // Append already fsyncs the touched segment + commits the tx, so this is
 // only needed if a caller wants to force a global sync barrier.
 func (idx *Index) Sync() error {
+	return idx.SyncCtx(context.Background())
+}
+
+// SyncCtx is the ctx-aware variant of Sync.
+func (idx *Index) SyncCtx(ctx context.Context) error {
+	_, span := obs.Tracer().Start(ctx, "index.sync")
+	defer span.End()
 	if err := idx.hot.SyncAll(); err != nil {
+		recordSpanError(span, err)
 		return err
 	}
 	if err := idx.cold.SyncAll(); err != nil {
+		recordSpanError(span, err)
 		return err
 	}
-	return idx.db.Sync()
+	if err := idx.db.Sync(); err != nil {
+		recordSpanError(span, err)
+		return err
+	}
+	return nil
 }
 
 // FragmentsOf returns a snapshot of the fragment list for one stripe.

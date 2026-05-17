@@ -91,3 +91,27 @@ services:
     #
     #   # Optional: FUSE ops slower than this log at debug level (default 1s).
     #   # - --slow-op-threshold=500ms
+    #
+    #   # Optional: OpenTelemetry tracing. Point at the Jaeger service
+    #   # below (or any OTLP/HTTP receiver). Sample low in production
+    #   # (0.001–0.01); crank to 1.0 only when actively debugging — the
+    #   # write path emits many spans per FUSE write and sampling them
+    #   # all can itself slow throughput.
+    #   # - --otel-endpoint=http://jaeger:4318
+    #   # - --otel-sample-ratio=1.0
+    #   # - --otel-service-name=placefs
+
+  # Uncomment to attach Jaeger for tracing. Jaeger >=v1.35 accepts OTLP
+  # natively on :4318 (HTTP) and :4317 (gRPC); placefs uses HTTP. Open the
+  # UI on http://localhost:16686 after `docker compose up jaeger`.
+  #
+  # jaeger:
+  #   image: jaegertracing/all-in-one:latest
+  #   container_name: place-jaeger
+  #   restart: unless-stopped
+  #   environment:
+  #     - COLLECTOR_OTLP_ENABLED=true
+  #   ports:
+  #     - "127.0.0.1:16686:16686"   # Jaeger UI
+  #     - "127.0.0.1:4318:4318"     # OTLP/HTTP (placefs --otel-endpoint target)
+  #     - "127.0.0.1:4317:4317"     # OTLP/gRPC (unused by placefs)
