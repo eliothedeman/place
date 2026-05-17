@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/eliothedeman/place/kv"
 	"github.com/eliothedeman/place/obs"
@@ -103,18 +105,25 @@ type Index struct {
 	// and a single Mutex turns them into a serial queue waiting on fsync.
 	writeMu sync.RWMutex
 
-	// commitLocks serializes the read-merge-write phase of concurrent
-	// appends targeting the same inode. bbolt's Batch gave us implicit
-	// serialization (one tx at a time, in-tx re-read); pebble batches
-	// run independently, so two appenders that both read "same existing
-	// state" would each write back the merged-with-only-their-fragments
-	// blob and lose each other's updates.
+	// commitLocks serializes the read-modify-write phase of concurrent
+	// appends to the same inode WHEN there is a txHook. With per-
+	// fragment keys, the fragment writes themselves are independent and
+	// don't need the lock — each writer Sets a distinct key. The hook
+	// (today: store node Size/Mtime update) still does a read-modify-
+	// write of the node, so concurrent writers to the same inode would
+	// lose each other's Size bumps without coordination.
 	//
-	// Per-inode striping keeps cross-inode concurrency (the common
-	// workload — many files, many writers) while sequentializing the
-	// rare same-inode case. The pool is small + hashed; collisions just
-	// add a touch of pessimistic locking, never correctness loss.
+	// Per-inode striping keeps cross-inode concurrency. The pool is
+	// small and hashed; collisions just add a touch of pessimistic
+	// locking, never correctness loss.
 	commitLocks [numCommitLocks]sync.Mutex
+
+	// seqGen issues monotonically increasing fragment seqs. Seeded at
+	// startup from time.Now().UnixNano(), which guarantees new seqs sort
+	// strictly above seqs from any previous boot (assuming the wall
+	// clock didn't go backward across the restart). Atomic so concurrent
+	// appenders can claim unique seqs without locking.
+	seqGen atomic.Uint64
 }
 
 // numCommitLocks is the size of the per-inode commit-lock pool. A power
@@ -195,13 +204,113 @@ func Open(cfg Config) (*Index, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Index{
+	idx := &Index{
 		cfg:        cfg,
 		stripeSize: cfg.StripeSize,
 		db:         db,
 		hot:        hot,
 		cold:       cold,
-	}, nil
+	}
+	// Seed the per-fragment seq counter. Using wall-clock nanos as the
+	// seed gives a value that's monotonically above anything any earlier
+	// boot wrote, so we don't need to scan the DB at startup. If the
+	// wall clock skews backward across a restart, the next migrateBlobs
+	// scan still catches any too-low seqs and bumps the counter past
+	// them.
+	idx.seqGen.Store(uint64(time.Now().UnixNano()))
+	if err := idx.migrateBlobsToFragments(); err != nil {
+		idx.Close()
+		return nil, fmt.Errorf("index: blob→fragment migration: %w", err)
+	}
+	return idx, nil
+}
+
+// nextSeq returns a fresh, never-reused fragment seq. Atomic Add gives
+// us monotonicity across concurrent appenders for free.
+func (idx *Index) nextSeq() uint64 {
+	return idx.seqGen.Add(1)
+}
+
+// migrateBlobsToFragments walks the legacy blob-per-stripe layout (length-13
+// keys under the 's' tag, value = concatenated Fragment list) and splits each
+// blob into per-fragment keys (length-21, value = single Fragment), then
+// deletes the blob. Idempotent: a clean DB has no length-13 keys and the
+// scan is a single Pebble prefix iter that completes in µs.
+//
+// Run once at Open. Concurrent writes haven't started yet, so the scan
+// sees a stable snapshot. After migration the data path only handles
+// per-fragment keys.
+func (idx *Index) migrateBlobsToFragments() error {
+	prefix := kv.StripeAllPrefix()
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return err
+	}
+	var (
+		legacyKeys [][]byte
+		newSets    []struct{ k, v []byte }
+		maxSeq     uint64
+	)
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if !kv.IsLegacyStripeKey(k) {
+			// Stray per-fragment key — possibly left over from a partial
+			// migration. Treat its seq as authoritative when seeding
+			// the counter.
+			if kv.IsFragmentKey(k) {
+				if s := kv.SeqFromFragmentKey(k); s > maxSeq {
+					maxSeq = s
+				}
+			}
+			continue
+		}
+		inode := kv.StripeInodeFromFragmentKey(k) // legacy keys share the same inode encoding
+		stripeID := kv.StripeIDFromFragmentKey(k)
+		legacyKeys = append(legacyKeys, append([]byte{}, k...))
+		for _, f := range decodeFragments(it.Value()) {
+			if f.Seq > maxSeq {
+				maxSeq = f.Seq
+			}
+			newSets = append(newSets, struct{ k, v []byte }{
+				k: kv.FragmentKey(inode, stripeID, f.Seq),
+				v: encodeFragments([]Fragment{f}),
+			})
+		}
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
+	if len(legacyKeys) == 0 && maxSeq == 0 {
+		return nil
+	}
+	// Make sure the in-memory seq generator starts above any
+	// previously-issued seq.
+	for {
+		cur := idx.seqGen.Load()
+		if cur > maxSeq {
+			break
+		}
+		if idx.seqGen.CompareAndSwap(cur, maxSeq+1) {
+			break
+		}
+	}
+	if len(legacyKeys) == 0 {
+		return nil
+	}
+	b := idx.db.NewBatch()
+	for _, s := range newSets {
+		if err := b.Set(s.k, s.v); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	for _, k := range legacyKeys {
+		if err := b.Delete(k); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	return b.Commit(true)
 }
 
 // Close releases all resources. Idempotent.
@@ -325,11 +434,12 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	}()
 	ctx = heldCtx
 
-	// Stage every chunk: write to segment + fsync, build a pending
-	// fragment record. We do not touch pebble yet — that's all in the
-	// single commit below.
+	// Stage every chunk: assign a fresh seq atomically (no lock needed —
+	// seqGen.Add is contention-free), write to segment + fsync, record
+	// the fragment for the batch below.
 	type pending struct {
 		stripeID uint32
+		seq      uint64
 		frag     Fragment
 	}
 	var pendings []pending
@@ -345,15 +455,13 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		}
 		chunk := rem[:chunkLen]
 
+		seq := idx.nextSeq()
 		set := idx.setFor(tier)
 		seg, err := set.ActiveCtx(ctx, segment.FramedSize(len(chunk)))
 		if err != nil {
 			recordSpanError(span, err)
 			return err
 		}
-		// Seq=0 in the on-disk header: the bbolt-side Seq is assigned
-		// inside the batch below. The on-disk Seq is only consulted by
-		// the catastrophic-rebuild path; reads always come from pebble.
 		appCtx, appSpan := obs.Tracer().Start(ctx, "segment.append")
 		appSpan.SetAttributes(
 			attribute.Int("bytes", len(chunk)),
@@ -363,7 +471,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		payloadOff, err := seg.AppendCtx(appCtx, segment.RecordHeader{
 			Inode:      inode,
 			StripeID:   stripeID,
-			Seq:        0,
+			Seq:        seq,
 			LogicalOff: off,
 			Length:     uint32(len(chunk)),
 		}, chunk)
@@ -372,11 +480,6 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 			recordSpanError(span, err)
 			return err
 		}
-		// segment.sync is the fsync(2) on the segment file — typically the
-		// single biggest contributor to per-write latency on SSD/NVMe (the
-		// device flushes its write cache + ext4/xfs writes a journal
-		// barrier). Concurrent appenders' fsyncs collapse in the kernel,
-		// so we don't hold any lock across this.
 		if err := seg.SyncCtx(ctx); err != nil {
 			recordSpanError(span, err)
 			return err
@@ -384,13 +487,14 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 
 		pendings = append(pendings, pending{
 			stripeID: stripeID,
+			seq:      seq,
 			frag: Fragment{
+				Seq:           seq,
 				LogicalOff:    off,
 				Length:        chunkLen,
 				Tier:          tier,
 				SegmentID:     seg.ID(),
 				SegmentOffset: payloadOff,
-				// Seq filled in inside the batch
 			},
 		})
 		rem = rem[chunkLen:]
@@ -400,50 +504,28 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	span.SetAttributes(attribute.Int("chunks", chunkIdx))
 
 	// One pebble commit covers every fragment + the optional hook.
-	// pebble.commit_fn times just our work building the batch; the gap
-	// to pebble.commit is the WAL fsync, which is the irreducible cost.
-	//
-	// Take the per-inode commit lock before the read-merge-write so
-	// concurrent appenders to the same inode don't lose each other's
-	// fragments. The lock is held only for the duration of the batch
-	// construction + commit (which is fast — the WAL fsync coalesces in
-	// pebble's group commit across the lock boundary).
-	cl := idx.commitLockFor(inode)
-	cl.Lock()
-	defer cl.Unlock()
+	// Per-fragment keys mean fragment Sets never conflict with each
+	// other — concurrent appenders to the same inode/stripe write to
+	// distinct keys (distinguished by their unique seq), so the only
+	// reason we'd still need the per-inode lock is the hook's
+	// read-modify-write (e.g. node.Size = max(...)). Without a hook we
+	// skip the lock entirely; with a hook we take it for the duration
+	// of the commit so concurrent hooks don't lose each other's
+	// updates.
+	if txHook != nil {
+		cl := idx.commitLockFor(inode)
+		cl.Lock()
+		defer cl.Unlock()
+	}
 	batchCtx, commitSpan := obs.Tracer().Start(ctx, "pebble.commit")
-	commitSpan.SetAttributes(attribute.Int("fragments", len(pendings)))
+	commitSpan.SetAttributes(
+		attribute.Int("fragments", len(pendings)),
+		attribute.Bool("lock_held", txHook != nil),
+	)
 	b := idx.db.NewBatch()
 	_, fnSpan := obs.Tracer().Start(batchCtx, "pebble.commit_fn")
-	// Group fragments by stripe so we read+write each stripe's blob
-	// only once even if multiple chunks landed in the same stripe.
-	byStripe := map[uint32][]Fragment{}
 	for _, p := range pendings {
-		byStripe[p.stripeID] = append(byStripe[p.stripeID], p.frag)
-	}
-	for stripeID, frags := range byStripe {
-		key := kv.StripeKey(inode, stripeID)
-		existingBytes, err := idx.db.Get(key)
-		if err != nil {
-			fnSpan.End()
-			commitSpan.End()
-			b.Close()
-			recordSpanError(span, err)
-			return err
-		}
-		existing := decodeFragments(existingBytes)
-		var maxSeq uint64
-		for _, f := range existing {
-			if f.Seq > maxSeq {
-				maxSeq = f.Seq
-			}
-		}
-		for i := range frags {
-			maxSeq++
-			frags[i].Seq = maxSeq
-			existing = append(existing, frags[i])
-		}
-		if err := b.Set(key, encodeFragments(existing)); err != nil {
+		if err := b.Set(kv.FragmentKey(inode, p.stripeID, p.seq), encodeFragments([]Fragment{p.frag})); err != nil {
 			fnSpan.End()
 			commitSpan.End()
 			b.Close()
@@ -503,21 +585,44 @@ func (idx *Index) PlanReadCtx(ctx context.Context, inode uint64, off, length int
 
 	first := idx.stripeOf(off)
 	last := idx.stripeOf(off + length - 1)
-	var allFrags []Fragment
-	for s := first; s <= last; s++ {
-		v, err := idx.db.Get(kv.StripeKey(inode, s))
-		if err != nil {
-			recordSpanError(span, err)
-			return nil, err
-		}
-		if v == nil {
-			continue
-		}
-		allFrags = append(allFrags, decodeFragments(v)...)
+	allFrags, err := idx.fragmentsInRange(inode, first, last)
+	if err != nil {
+		recordSpanError(span, err)
+		return nil, err
 	}
 	plan := planRead(allFrags, off, length)
 	span.SetAttributes(attribute.Int("slices", len(plan)))
 	return plan, nil
+}
+
+// fragmentsInRange returns every fragment for inode in stripes [first, last]
+// inclusive. Iterates a single prefix scan and decodes each per-fragment
+// value. Used by PlanRead and friends.
+func (idx *Index) fragmentsInRange(inode uint64, first, last uint32) ([]Fragment, error) {
+	lo := kv.FragmentStripePrefix(inode, first)
+	// Upper bound is "one past the last stripe": same shape as lo, with
+	// stripeID = last+1. If last is MaxUint32 we fall back to scanning
+	// the whole inode prefix.
+	var hi []byte
+	if last == ^uint32(0) {
+		hi = kv.PrefixUpperBound(kv.StripePrefix(inode))
+	} else {
+		hi = kv.FragmentStripePrefix(inode, last+1)
+	}
+	it, err := idx.db.Iter(lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []Fragment
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if !kv.IsFragmentKey(k) {
+			continue
+		}
+		out = append(out, decodeFragments(it.Value())...)
+	}
+	return out, nil
 }
 
 // ReadAt pulls bytes from disk for one Locator. Returns the number of bytes
@@ -659,37 +764,17 @@ func (s *BulkSession) Commit() error {
 		}
 	}
 	b := s.idx.db.NewBatch()
-	// Group pending fragments by stripe.
-	byStripe := map[uint32][]pendingFrag{}
 	for _, pf := range s.pending {
-		byStripe[pf.stripeID] = append(byStripe[pf.stripeID], pf)
-	}
-	for stripeID, frags := range byStripe {
-		key := kv.StripeKey(s.inode, stripeID)
-		existingBytes, err := s.idx.db.Get(key)
-		if err != nil {
-			b.Close()
-			return err
+		seq := s.idx.nextSeq()
+		frag := Fragment{
+			Seq:           seq,
+			LogicalOff:    pf.logicalOff,
+			Length:        pf.length,
+			Tier:          s.tier,
+			SegmentID:     pf.segmentID,
+			SegmentOffset: pf.segmentOffset,
 		}
-		existing := decodeFragments(existingBytes)
-		var maxSeq uint64
-		for _, f := range existing {
-			if f.Seq > maxSeq {
-				maxSeq = f.Seq
-			}
-		}
-		for _, pf := range frags {
-			maxSeq++
-			existing = append(existing, Fragment{
-				Seq:           maxSeq,
-				LogicalOff:    pf.logicalOff,
-				Length:        pf.length,
-				Tier:          s.tier,
-				SegmentID:     pf.segmentID,
-				SegmentOffset: pf.segmentOffset,
-			})
-		}
-		if err := b.Set(key, encodeFragments(existing)); err != nil {
+		if err := b.Set(kv.FragmentKey(s.inode, pf.stripeID, seq), encodeFragments([]Fragment{frag})); err != nil {
 			b.Close()
 			return err
 		}
@@ -712,10 +797,9 @@ func (idx *Index) Truncate(inode uint64, size int64) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
 
-	// Collect every (key, decision) under the inode prefix, then apply
-	// in one batch. We don't mutate during iteration because pebble
-	// iterator semantics for in-flight writes vary by iterator kind, and
-	// "collect then apply" is dead simple and fast.
+	// Iterate every per-fragment key under inode, decide per fragment
+	// whether to keep / clip / delete. Collect ops first, apply in one
+	// batch — mutating during iteration is dicey across LSM iterators.
 	prefix := kv.StripePrefix(inode)
 	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
 	if err != nil {
@@ -727,33 +811,28 @@ func (idx *Index) Truncate(inode uint64, size int64) error {
 	}
 	var ops []op
 	for it.First(); it.Valid(); it.Next() {
-		k := append([]byte{}, it.Key()...)
-		v := it.Value()
-		stripeID := kv.StripeIDFromKey(k)
-		stripeStart := int64(stripeID) * idx.stripeSize
-		if stripeStart >= size {
-			ops = append(ops, op{key: k})
+		k := it.Key()
+		if !kv.IsFragmentKey(k) {
 			continue
 		}
-		frags := decodeFragments(v)
-		var kept []Fragment
-		for _, f := range frags {
-			if f.LogicalOff >= size {
-				continue
-			}
-			end := f.LogicalOff + f.Length
-			if end > size {
-				// Clip: keep [LogicalOff, size). Trailing bytes in the
-				// segment become future GC fodder; the fragment record
-				// itself just stops describing them.
-				f.Length = size - f.LogicalOff
-			}
-			kept = append(kept, f)
+		stripeID := kv.StripeIDFromFragmentKey(k)
+		seq := kv.SeqFromFragmentKey(k)
+		stripeStart := int64(stripeID) * idx.stripeSize
+		keyCopy := append([]byte{}, k...)
+		if stripeStart >= size {
+			ops = append(ops, op{key: keyCopy})
+			continue
 		}
-		if len(kept) == 0 {
-			ops = append(ops, op{key: k})
-		} else {
-			ops = append(ops, op{key: k, val: encodeFragments(kept)})
+		frag := decodeFragments(it.Value())[0]
+		_ = seq // seq is in the key; not used here
+		if frag.LogicalOff >= size {
+			ops = append(ops, op{key: keyCopy})
+			continue
+		}
+		end := frag.LogicalOff + frag.Length
+		if end > size {
+			frag.Length = size - frag.LogicalOff
+			ops = append(ops, op{key: keyCopy, val: encodeFragments([]Fragment{frag})})
 		}
 	}
 	if err := it.Close(); err != nil {
@@ -793,6 +872,9 @@ func (idx *Index) DeleteInode(inode uint64) error {
 	if err := it.Close(); err != nil {
 		return err
 	}
+	if len(keys) == 0 {
+		return nil
+	}
 	b := idx.db.NewBatch()
 	for _, k := range keys {
 		if err := b.Delete(k); err != nil {
@@ -815,7 +897,8 @@ type StripeInfo struct {
 }
 
 // IterStripes calls fn for every stripe that has at least one fragment.
-// Stopping (fn returns false) ends iteration.
+// Stopping (fn returns false) ends iteration. Aggregates per-fragment
+// keys into one StripeInfo per (inode, stripeID).
 func (idx *Index) IterStripes(fn func(StripeInfo) bool) error {
 	prefix := kv.StripeAllPrefix()
 	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
@@ -823,30 +906,60 @@ func (idx *Index) IterStripes(fn func(StripeInfo) bool) error {
 		return err
 	}
 	defer it.Close()
-	for it.First(); it.Valid(); it.Next() {
-		k := it.Key()
-		if len(k) != 13 { // tag(1) + inode(8) + stripeID(4)
-			continue
+	// Adjacent fragment keys for the same (inode, stripeID) sort
+	// together (same prefix; only seq differs), so we can accumulate
+	// per-stripe state and flush on transition.
+	var (
+		have                    bool
+		curInode                uint64
+		curStripe               uint32
+		curFrags                []Fragment
+		curHotBytes, curColdBytes int64
+	)
+	flush := func() bool {
+		if !have {
+			return true
 		}
 		info := StripeInfo{
-			Inode:    kv.StripeInodeFromKey(k),
-			StripeID: kv.StripeIDFromKey(k),
+			Inode:     curInode,
+			StripeID:  curStripe,
+			HotBytes:  curHotBytes,
+			ColdBytes: curColdBytes,
 		}
-		frags := decodeFragments(it.Value())
-		for _, f := range frags {
-			switch f.Tier {
-			case segment.TierHot:
-				info.HotBytes += f.Length
-			case segment.TierCold:
-				info.ColdBytes += f.Length
-			}
-		}
-		for _, f := range canonicalView(frags) {
+		for _, f := range canonicalView(curFrags) {
 			info.LiveBytes += f.Length
 		}
-		if !fn(info) {
-			return nil
+		return fn(info)
+	}
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if !kv.IsFragmentKey(k) {
+			continue
 		}
+		ino := kv.StripeInodeFromFragmentKey(k)
+		sid := kv.StripeIDFromFragmentKey(k)
+		if !have || ino != curInode || sid != curStripe {
+			if !flush() {
+				return nil
+			}
+			have = true
+			curInode = ino
+			curStripe = sid
+			curFrags = curFrags[:0]
+			curHotBytes = 0
+			curColdBytes = 0
+		}
+		f := decodeFragments(it.Value())[0]
+		curFrags = append(curFrags, f)
+		switch f.Tier {
+		case segment.TierHot:
+			curHotBytes += f.Length
+		case segment.TierCold:
+			curColdBytes += f.Length
+		}
+	}
+	if !flush() {
+		return nil
 	}
 	return nil
 }
@@ -868,37 +981,43 @@ func (idx *Index) Move(inode uint64, stripeID uint32, target Tier) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
 
-	// Snapshot the current fragment list.
-	v, err := idx.db.Get(kv.StripeKey(inode, stripeID))
+	// Snapshot the current fragment list + remember the keys so we can
+	// delete them in the same batch that writes the rewritten layout.
+	prefix := kv.FragmentStripePrefix(inode, stripeID)
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
 	if err != nil {
 		return err
 	}
-	frags := decodeFragments(v)
+	var (
+		frags    []Fragment
+		oldKeys  [][]byte
+	)
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if !kv.IsFragmentKey(k) {
+			continue
+		}
+		oldKeys = append(oldKeys, append([]byte{}, k...))
+		frags = append(frags, decodeFragments(it.Value())...)
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
 	if len(frags) == 0 {
 		return nil
 	}
 
 	view := canonicalView(frags)
 
-	// Determine starting seq for the rewritten fragments. Bump above the
-	// existing max so readers consistently see "the newer view wins."
-	var maxSeq uint64
-	for _, f := range frags {
-		if f.Seq > maxSeq {
-			maxSeq = f.Seq
-		}
-	}
-	nextSeq := maxSeq + 1
-
 	// Walk the canonical view; for fragments not in target tier, copy bytes.
 	var newFrags []Fragment
 	targetSet := idx.setFor(target)
 	for _, f := range view {
+		newSeq := idx.nextSeq()
 		if f.Tier == target {
-			// Re-emit with a new seq so the rewritten list is a clean tail-
-			// free canonical layout.
-			f.Seq = nextSeq
-			nextSeq++
+			// Re-emit with a new seq so the rewritten list is a clean
+			// tail-free canonical layout.
+			f.Seq = newSeq
 			newFrags = append(newFrags, f)
 			continue
 		}
@@ -916,7 +1035,7 @@ func (idx *Index) Move(inode uint64, stripeID uint32, target Tier) error {
 			return err
 		}
 		payloadOff, err := seg.Append(segment.RecordHeader{
-			Inode: inode, StripeID: stripeID, Seq: nextSeq,
+			Inode: inode, StripeID: stripeID, Seq: newSeq,
 			LogicalOff: f.LogicalOff, Length: uint32(len(buf)),
 		}, buf)
 		if err != nil {
@@ -926,31 +1045,29 @@ func (idx *Index) Move(inode uint64, stripeID uint32, target Tier) error {
 			return err
 		}
 		newFrags = append(newFrags, Fragment{
-			Seq:           nextSeq,
+			Seq:           newSeq,
 			LogicalOff:    f.LogicalOff,
 			Length:        f.Length,
 			Tier:          target,
 			SegmentID:     seg.ID(),
 			SegmentOffset: payloadOff,
 		})
-		nextSeq++
 	}
 
-	// Swap in the new list. We hold writeMu so no Append could have
-	// raced; the defensive re-read is still cheap and keeps the
-	// invariant local and obvious.
-	currentBytes, err := idx.db.Get(kv.StripeKey(inode, stripeID))
-	if err != nil {
-		return err
-	}
-	current := decodeFragments(currentBytes)
-	if !sameFragments(current, frags) {
-		return errors.New("index: Move: concurrent modification (should not happen with writeMu held)")
-	}
+	// Atomically swap: delete every old per-fragment key, write the new
+	// ones. writeMu is held the whole time so no Append can race.
 	b := idx.db.NewBatch()
-	if err := b.Set(kv.StripeKey(inode, stripeID), encodeFragments(newFrags)); err != nil {
-		b.Close()
-		return err
+	for _, k := range oldKeys {
+		if err := b.Delete(k); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	for _, f := range newFrags {
+		if err := b.Set(kv.FragmentKey(inode, stripeID, f.Seq), encodeFragments([]Fragment{f})); err != nil {
+			b.Close()
+			return err
+		}
 	}
 	return b.Commit(true)
 }
@@ -982,6 +1099,9 @@ func (idx *Index) GC() error {
 		return err
 	}
 	for it.First(); it.Valid(); it.Next() {
+		if !kv.IsFragmentKey(it.Key()) {
+			continue
+		}
 		for _, f := range decodeFragments(it.Value()) {
 			referenced[f.Tier][f.SegmentID] = true
 		}
@@ -1100,11 +1220,20 @@ func (idx *Index) SyncCtx(ctx context.Context) error {
 // FragmentsOf returns a snapshot of the fragment list for one stripe.
 // Used by tests and by L3 for inspection. Returns nil if absent.
 func (idx *Index) FragmentsOf(inode uint64, stripeID uint32) ([]Fragment, error) {
-	v, err := idx.db.Get(kv.StripeKey(inode, stripeID))
+	prefix := kv.FragmentStripePrefix(inode, stripeID)
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
 	if err != nil {
 		return nil, err
 	}
-	return decodeFragments(v), nil
+	defer it.Close()
+	var out []Fragment
+	for it.First(); it.Valid(); it.Next() {
+		if !kv.IsFragmentKey(it.Key()) {
+			continue
+		}
+		out = append(out, decodeFragments(it.Value())...)
+	}
+	return out, nil
 }
 
 // StripesOf returns every stripe id that has fragments for inode.
@@ -1115,9 +1244,17 @@ func (idx *Index) StripesOf(inode uint64) ([]uint32, error) {
 		return nil, err
 	}
 	defer it.Close()
-	var out []uint32
+	seen := map[uint32]struct{}{}
 	for it.First(); it.Valid(); it.Next() {
-		out = append(out, kv.StripeIDFromKey(it.Key()))
+		k := it.Key()
+		if !kv.IsFragmentKey(k) {
+			continue
+		}
+		seen[kv.StripeIDFromFragmentKey(k)] = struct{}{}
+	}
+	out := make([]uint32, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil

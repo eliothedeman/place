@@ -101,7 +101,10 @@ func MigrateFromBolt(boltPath, pebblePath string, progress func(bucket string, n
 			if len(k) != 12 {
 				return nil, fmt.Errorf("kv migrate: stripes key length %d", len(k))
 			}
-			return StripeKey(
+			// Land the legacy blob under the same legacy key shape;
+			// the per-fragment migration in index.Open will split it
+			// out into per-fragment keys on first start.
+			return LegacyStripeKey(
 				binary.BigEndian.Uint64(k[:8]),
 				binary.BigEndian.Uint32(k[8:]),
 			), nil

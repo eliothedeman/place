@@ -73,8 +73,10 @@ func DirentNameFromKey(k []byte) string {
 	return string(k[9:])
 }
 
-// StripeKey returns the key for one (inode, stripeID) fragment list.
-func StripeKey(inode uint64, stripeID uint32) []byte {
+// LegacyStripeKey returns the bbolt-era key that stored every fragment for
+// (inode, stripeID) as one concatenated value. Used only by the
+// blob-to-per-fragment migration at startup.
+func LegacyStripeKey(inode uint64, stripeID uint32) []byte {
 	k := make([]byte, 1+8+4)
 	k[0] = tagStripe
 	binary.BigEndian.PutUint64(k[1:], inode)
@@ -82,7 +84,36 @@ func StripeKey(inode uint64, stripeID uint32) []byte {
 	return k
 }
 
-// StripePrefix returns the prefix that covers every stripe key for inode.
+// FragmentKey returns the per-fragment key. Length is 21 bytes: the
+// trailing 8-byte seq lets concurrent appenders write to distinct keys
+// without read-merge-write, which is the entire point of moving away
+// from the old blob-per-stripe layout.
+func FragmentKey(inode uint64, stripeID uint32, seq uint64) []byte {
+	k := make([]byte, 1+8+4+8)
+	k[0] = tagStripe
+	binary.BigEndian.PutUint64(k[1:], inode)
+	binary.BigEndian.PutUint32(k[9:], stripeID)
+	binary.BigEndian.PutUint64(k[13:], seq)
+	return k
+}
+
+// FragmentStripePrefix returns the prefix covering every fragment under
+// (inode, stripeID). Pair with PrefixUpperBound to scan one stripe.
+//
+// Note this is the same byte sequence as LegacyStripeKey — old-format
+// blobs sit under their stripe prefix too. Callers can detect format by
+// key length: 13 bytes == legacy blob, 21 bytes == per-fragment record.
+// The migration deletes the legacy keys at startup so the data path
+// only sees the new format.
+func FragmentStripePrefix(inode uint64, stripeID uint32) []byte {
+	k := make([]byte, 1+8+4)
+	k[0] = tagStripe
+	binary.BigEndian.PutUint64(k[1:], inode)
+	binary.BigEndian.PutUint32(k[9:], stripeID)
+	return k
+}
+
+// StripePrefix returns the prefix covering every stripe key for inode.
 func StripePrefix(inode uint64) []byte {
 	k := make([]byte, 1+8)
 	k[0] = tagStripe
@@ -90,19 +121,33 @@ func StripePrefix(inode uint64) []byte {
 	return k
 }
 
-// StripeAllPrefix returns the prefix that covers every stripe key in the DB.
-// Used by GC, which scans every fragment to build the live-segment set.
+// StripeAllPrefix returns the prefix that covers every fragment key in
+// the DB. Used by GC, which scans every fragment to build the live-
+// segment set.
 func StripeAllPrefix() []byte { return []byte{tagStripe} }
 
-// StripeIDFromKey extracts the stripeID embedded in a stripe key.
-func StripeIDFromKey(k []byte) uint32 {
+// StripeIDFromFragmentKey extracts the stripeID embedded in a fragment key.
+func StripeIDFromFragmentKey(k []byte) uint32 {
 	return binary.BigEndian.Uint32(k[9:13])
 }
 
-// StripeInodeFromKey extracts the inode embedded in a stripe key.
-func StripeInodeFromKey(k []byte) uint64 {
+// StripeInodeFromFragmentKey extracts the inode embedded in a fragment key.
+func StripeInodeFromFragmentKey(k []byte) uint64 {
 	return binary.BigEndian.Uint64(k[1:9])
 }
+
+// SeqFromFragmentKey extracts the seq embedded in a fragment key.
+func SeqFromFragmentKey(k []byte) uint64 {
+	return binary.BigEndian.Uint64(k[13:21])
+}
+
+// IsFragmentKey reports whether k has the per-fragment length, vs. the
+// legacy blob length. Cheap classifier for the iterator paths that may
+// observe both shapes during/after migration.
+func IsFragmentKey(k []byte) bool { return len(k) == 21 }
+
+// IsLegacyStripeKey reports whether k has the bbolt-era blob length.
+func IsLegacyStripeKey(k []byte) bool { return len(k) == 13 }
 
 // PrefixUpperBound returns the smallest byte slice that sorts strictly above
 // every key starting with prefix. Used as Pebble iterator UpperBound to
