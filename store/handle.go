@@ -2,13 +2,12 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"time"
 
 	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/kv"
 	"github.com/eliothedeman/place/obs"
-	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -117,13 +116,14 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 
 	end := off + int64(len(p))
 	now := time.Now().UnixNano()
-	// nodeUpdate runs inside index's batch tx. It is idempotent: setting
-	// Size = max(Size, end) and Mtime = now produces the same result on
-	// a Batch retry. (Mtime "moves backward by a few µs across a retry"
-	// would be a non-issue and isn't actually possible since `now` is
-	// captured before the batch starts.)
-	nodeUpdate := func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNodes).Get(inodeKey(h.inode))
+	// nodeUpdate runs inside index's pebble batch. The read is against
+	// the parent DB (kv.Batch.Get goes to the DB, not the batch), so it
+	// sees the pre-commit state — same as the bbolt-era semantics.
+	nodeUpdate := func(b *kv.Batch) error {
+		v, err := b.Get(kv.NodeKey(h.inode))
+		if err != nil {
+			return err
+		}
 		if v == nil {
 			return fmt.Errorf("store: write to inode %d with no node entry", h.inode)
 		}
@@ -136,7 +136,7 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 		}
 		n.Mtime = now
 		n.Ctime = now
-		return tx.Bucket(bucketNodes).Put(inodeKey(h.inode), encodeNode(n))
+		return b.Set(kv.NodeKey(h.inode), encodeNode(n))
 	}
 	if err := h.store.idx.AppendToWithTxCtx(ctx, h.inode, off, p, tier, nodeUpdate); err != nil {
 		recordHandleSpanError(span, err)
@@ -193,22 +193,28 @@ func (b *BulkWriter) Commit() error {
 		return err
 	}
 	now := time.Now().UnixNano()
-	return b.h.store.db.Update(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNodes).Get(inodeKey(b.h.inode))
-		if v == nil {
-			return fmt.Errorf("store: bulk commit on inode %d with no node entry", b.h.inode)
-		}
-		n, err := decodeNode(v)
-		if err != nil {
-			return err
-		}
-		if b.maxEnd > n.Size {
-			n.Size = b.maxEnd
-		}
-		n.Mtime = now
-		n.Ctime = now
-		return tx.Bucket(bucketNodes).Put(inodeKey(b.h.inode), encodeNode(n))
-	})
+	v, err := b.h.store.db.Get(kv.NodeKey(b.h.inode))
+	if err != nil {
+		return err
+	}
+	if v == nil {
+		return fmt.Errorf("store: bulk commit on inode %d with no node entry", b.h.inode)
+	}
+	n, err := decodeNode(v)
+	if err != nil {
+		return err
+	}
+	if b.maxEnd > n.Size {
+		n.Size = b.maxEnd
+	}
+	n.Mtime = now
+	n.Ctime = now
+	batch := b.h.store.db.NewBatch()
+	if err := batch.Set(kv.NodeKey(b.h.inode), encodeNode(n)); err != nil {
+		batch.Close()
+		return err
+	}
+	return batch.Commit(true)
 }
 
 // Abort discards the session without committing. Bytes already on disk
@@ -238,5 +244,3 @@ func (h *Handle) Close() error {
 	return nil
 }
 
-// Avoid unused-import lint:
-var _ = binary.LittleEndian

@@ -4,14 +4,13 @@
 // (mode, nlinks, size, times, symlink targets) — everything that gives the
 // L2 index its filesystem semantics.
 //
-// Store buckets live in the same bbolt DB that the index owns; the index
-// exposes its DB() for this exact purpose. The buckets used here are kept
-// disjoint from L2's stripes/_meta buckets so neither layer reaches into
-// the other's state.
+// Store keys live in the same pebble DB the index owns; the index exposes
+// its DB() for this exact purpose. The two layers use disjoint key tags
+// (kv.NodeKey/DirentKey/etc. for L4, kv.StripeKey for L2) so neither layer
+// reaches into the other's state.
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,8 +21,8 @@ import (
 	"time"
 
 	"github.com/eliothedeman/place/index"
+	"github.com/eliothedeman/place/kv"
 	"github.com/eliothedeman/place/segment"
-	bolt "go.etcd.io/bbolt"
 )
 
 // Standard mode bits (a subset of <sys/stat.h>). Mirrored here so callers
@@ -46,15 +45,7 @@ func (m Mode) IsSymlink() bool { return m&ModeMask == ModeSymlink }
 // RootInode is the well-known root directory id.
 const RootInode uint64 = 1
 
-var (
-	bucketL4Meta  = []byte("_l4_meta")
-	bucketNodes   = []byte("nodes")
-	bucketDirents = []byte("dirents")
-
-	metaNextInode = []byte("next_inode")
-)
-
-// Node is the per-inode metadata stored in bucketNodes.
+// Node is the per-inode metadata stored under kv.NodeKey(inode).
 type Node struct {
 	Inode         uint64
 	Mode          Mode
@@ -78,7 +69,7 @@ type DirEntry struct {
 // Store is the L4 handle. Constructed with Open.
 type Store struct {
 	idx *index.Index
-	db  *bolt.DB
+	db  *kv.DB
 
 	// openMu guards path lookups against concurrent rename, since rename is
 	// otherwise the only operation that violates "ancestor exists ⇒ stays
@@ -89,45 +80,43 @@ type Store struct {
 // Open builds a Store on top of an already-open index.
 func Open(idx *index.Index) (*Store, error) {
 	s := &Store{idx: idx, db: idx.DB()}
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketL4Meta, bucketNodes, bucketDirents} {
-			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
-				return err
-			}
-		}
-		// Ensure inode allocator has reserved RootInode = 1, then create the
-		// root node if it's not already there.
-		mb := tx.Bucket(bucketL4Meta)
-		v := mb.Get(metaNextInode)
-		var next uint64 = RootInode + 1
-		if len(v) == 8 {
-			next = binary.LittleEndian.Uint64(v)
-			if next < RootInode+1 {
-				next = RootInode + 1
-			}
-		}
-		var nb [8]byte
-		binary.LittleEndian.PutUint64(nb[:], next)
-		if err := mb.Put(metaNextInode, nb[:]); err != nil {
-			return err
-		}
-		nodes := tx.Bucket(bucketNodes)
-		if nodes.Get(inodeKey(RootInode)) == nil {
-			now := time.Now().UnixNano()
-			root := Node{
-				Inode: RootInode,
-				Mode:  ModeDir | 0o755,
-				Nlink: 2,
-				Size:  0,
-				Mtime: now, Ctime: now, Atime: now,
-			}
-			if err := nodes.Put(inodeKey(RootInode), encodeNode(root)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	// Seed the inode allocator and create the root node if absent.
+	v, err := s.db.Get(kv.StoreNextInodeKey)
 	if err != nil {
+		return nil, err
+	}
+	var next uint64 = RootInode + 1
+	if len(v) == 8 {
+		next = binary.LittleEndian.Uint64(v)
+		if next < RootInode+1 {
+			next = RootInode + 1
+		}
+	}
+	batch := s.db.NewBatch()
+	var nb [8]byte
+	binary.LittleEndian.PutUint64(nb[:], next)
+	if err := batch.Set(kv.StoreNextInodeKey, nb[:]); err != nil {
+		batch.Close()
+		return nil, err
+	}
+	if rv, err := s.db.Get(kv.NodeKey(RootInode)); err != nil {
+		batch.Close()
+		return nil, err
+	} else if rv == nil {
+		now := time.Now().UnixNano()
+		root := Node{
+			Inode: RootInode,
+			Mode:  ModeDir | 0o755,
+			Nlink: 2,
+			Size:  0,
+			Mtime: now, Ctime: now, Atime: now,
+		}
+		if err := batch.Set(kv.NodeKey(RootInode), encodeNode(root)); err != nil {
+			batch.Close()
+			return nil, err
+		}
+	}
+	if err := batch.Commit(true); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -142,26 +131,7 @@ func (s *Store) Close() error {
 // lower-level vocabulary. Callers should not normally need this.
 func (s *Store) Index() *index.Index { return s.idx }
 
-// --- helpers ------------------------------------------------------------
-
-func inodeKey(inode uint64) []byte {
-	var k [8]byte
-	binary.BigEndian.PutUint64(k[:], inode)
-	return k[:]
-}
-
-func direntKey(parent uint64, name string) []byte {
-	k := make([]byte, 8+len(name))
-	binary.BigEndian.PutUint64(k[:8], parent)
-	copy(k[8:], name)
-	return k
-}
-
-func parentPrefix(parent uint64) []byte {
-	var k [8]byte
-	binary.BigEndian.PutUint64(k[:], parent)
-	return k[:]
-}
+// --- node encoding ------------------------------------------------------
 
 const nodeFixedSize = 58
 
@@ -204,22 +174,28 @@ func decodeNode(buf []byte) (Node, error) {
 	return n, nil
 }
 
-func allocInodeTx(tx *bolt.Tx) (uint64, error) {
-	mb := tx.Bucket(bucketL4Meta)
-	v := mb.Get(metaNextInode)
+// allocInode reserves a fresh inode id. Reads the current counter from
+// the DB, returns it, and queues the bumped value in the batch. The bump
+// only becomes durable when the batch commits, so a Rollback (Close
+// without Commit) leaves the counter where it was.
+func (s *Store) allocInode(b *kv.Batch) (uint64, error) {
+	v, err := s.db.Get(kv.StoreNextInodeKey)
+	if err != nil {
+		return 0, err
+	}
 	var next uint64 = RootInode + 1
 	if len(v) == 8 {
 		next = binary.LittleEndian.Uint64(v)
 	}
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], next+1)
-	if err := mb.Put(metaNextInode, buf[:]); err != nil {
+	if err := b.Set(kv.StoreNextInodeKey, buf[:]); err != nil {
 		return 0, err
 	}
 	return next, nil
 }
 
-// --- lookups ------------------------------------------------------------
+// --- error sentinels ----------------------------------------------------
 
 // ErrNotExist mirrors syscall.ENOENT for missing entries.
 var ErrNotExist = syscall.ENOENT
@@ -239,19 +215,52 @@ var ErrNotEmpty = syscall.ENOTEMPTY
 // ErrInvalid mirrors EINVAL.
 var ErrInvalid = syscall.EINVAL
 
+// --- read helpers -------------------------------------------------------
+
 // Stat returns the node metadata for inode.
 func (s *Store) Stat(inode uint64) (Node, error) {
-	var n Node
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNodes).Get(inodeKey(inode))
-		if v == nil {
-			return ErrNotExist
-		}
-		var derr error
-		n, derr = decodeNode(v)
-		return derr
-	})
-	return n, err
+	v, err := s.db.Get(kv.NodeKey(inode))
+	if err != nil {
+		return Node{}, err
+	}
+	if v == nil {
+		return Node{}, ErrNotExist
+	}
+	return decodeNode(v)
+}
+
+// readNode is a small helper for code paths inside a write batch that
+// want the parent-DB state for an inode. (Batch.Get goes to the parent.)
+func (s *Store) readNode(inode uint64) (Node, error) {
+	return s.Stat(inode)
+}
+
+// requireDir checks that inode exists and is a directory.
+func (s *Store) requireDir(inode uint64) error {
+	n, err := s.Stat(inode)
+	if err != nil {
+		return err
+	}
+	if !n.Mode.IsDir() {
+		return ErrNotDir
+	}
+	return nil
+}
+
+// readDirent returns the child inode encoded in a dirent value, or 0/false
+// if the dirent is absent.
+func (s *Store) readDirent(parent uint64, name string) (uint64, bool, error) {
+	v, err := s.db.Get(kv.DirentKey(parent, name))
+	if err != nil {
+		return 0, false, err
+	}
+	if v == nil {
+		return 0, false, nil
+	}
+	if len(v) != 8 {
+		return 0, false, fmt.Errorf("store: dirent blob %d bytes (want 8)", len(v))
+	}
+	return binary.BigEndian.Uint64(v), true, nil
 }
 
 // Lookup resolves one (parent, name) pair to a child node.
@@ -259,61 +268,41 @@ func (s *Store) Lookup(parent uint64, name string) (Node, error) {
 	if err := validName(name); err != nil {
 		return Node{}, err
 	}
-	var n Node
-	err := s.db.View(func(tx *bolt.Tx) error {
-		nv, err := lookupTx(tx, parent, name)
-		if err != nil {
-			return err
-		}
-		n = nv
-		return nil
-	})
-	return n, err
-}
-
-func lookupTx(tx *bolt.Tx, parent uint64, name string) (Node, error) {
-	dv := tx.Bucket(bucketDirents).Get(direntKey(parent, name))
-	if dv == nil {
+	child, ok, err := s.readDirent(parent, name)
+	if err != nil {
+		return Node{}, err
+	}
+	if !ok {
 		return Node{}, ErrNotExist
 	}
-	if len(dv) != 8 {
-		return Node{}, fmt.Errorf("store: dirent blob %d bytes (want 8)", len(dv))
-	}
-	child := binary.BigEndian.Uint64(dv)
-	nv := tx.Bucket(bucketNodes).Get(inodeKey(child))
-	if nv == nil {
+	n, err := s.Stat(child)
+	if err != nil {
 		return Node{}, fmt.Errorf("store: dangling dirent %d/%q → inode %d", parent, name, child)
 	}
-	return decodeNode(nv)
+	return n, nil
 }
 
 // LookupPath walks "/a/b/c" from root and returns the leaf node. An empty
-// or "/" path returns the root. Components are split on "/".
+// or "/" path returns the root.
 func (s *Store) LookupPath(p string) (Node, error) {
 	parts := splitPath(p)
 	s.openMu.RLock()
 	defer s.openMu.RUnlock()
-	var node Node
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNodes).Get(inodeKey(RootInode))
-		root, err := decodeNode(v)
+	node, err := s.Stat(RootInode)
+	if err != nil {
+		return Node{}, err
+	}
+	for _, name := range parts {
+		if !node.Mode.IsDir() {
+			return Node{}, ErrNotDir
+		}
+		child, err := s.Lookup(node.Inode, name)
 		if err != nil {
-			return err
+			return Node{}, err
 		}
-		node = root
-		for _, name := range parts {
-			if !node.Mode.IsDir() {
-				return ErrNotDir
-			}
-			child, err := lookupTx(tx, node.Inode, name)
-			if err != nil {
-				return err
-			}
-			node = child
-		}
-		return nil
-	})
-	return node, err
+		node = child
+	}
+	return node, nil
 }
 
 func splitPath(p string) []string {
@@ -331,6 +320,13 @@ func validName(name string) error {
 	return nil
 }
 
+// direntValue encodes a child inode for storage as a dirent value.
+func direntValue(inode uint64) []byte {
+	var v [8]byte
+	binary.BigEndian.PutUint64(v[:], inode)
+	return v[:]
+}
+
 // --- create / mkdir / symlink / link ------------------------------------
 
 // Create makes a new regular file at (parent, name). Returns the new node
@@ -340,36 +336,39 @@ func (s *Store) Create(parent uint64, name string, mode Mode, uid, gid uint32) (
 	if err := validName(name); err != nil {
 		return Node{}, nil, err
 	}
-	var n Node
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		if err := requireDirTx(tx, parent); err != nil {
-			return err
-		}
-		if tx.Bucket(bucketDirents).Get(direntKey(parent, name)) != nil {
-			return ErrExist
-		}
-		id, err := allocInodeTx(tx)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UnixNano()
-		n = Node{
-			Inode: id,
-			Mode:  ModeRegular | (mode & PermMask),
-			Nlink: 1,
-			UID:   uid,
-			GID:   gid,
-			Size:  0,
-			Mtime: now, Ctime: now, Atime: now,
-		}
-		if err := tx.Bucket(bucketNodes).Put(inodeKey(id), encodeNode(n)); err != nil {
-			return err
-		}
-		var cb [8]byte
-		binary.BigEndian.PutUint64(cb[:], id)
-		return tx.Bucket(bucketDirents).Put(direntKey(parent, name), cb[:])
-	})
+	if err := s.requireDir(parent); err != nil {
+		return Node{}, nil, err
+	}
+	if _, ok, err := s.readDirent(parent, name); err != nil {
+		return Node{}, nil, err
+	} else if ok {
+		return Node{}, nil, ErrExist
+	}
+	b := s.db.NewBatch()
+	id, err := s.allocInode(b)
 	if err != nil {
+		b.Close()
+		return Node{}, nil, err
+	}
+	now := time.Now().UnixNano()
+	n := Node{
+		Inode: id,
+		Mode:  ModeRegular | (mode & PermMask),
+		Nlink: 1,
+		UID:   uid,
+		GID:   gid,
+		Size:  0,
+		Mtime: now, Ctime: now, Atime: now,
+	}
+	if err := b.Set(kv.NodeKey(id), encodeNode(n)); err != nil {
+		b.Close()
+		return Node{}, nil, err
+	}
+	if err := b.Set(kv.DirentKey(parent, name), direntValue(id)); err != nil {
+		b.Close()
+		return Node{}, nil, err
+	}
+	if err := b.Commit(true); err != nil {
 		return Node{}, nil, err
 	}
 	return n, &Handle{store: s, inode: n.Inode}, nil
@@ -380,38 +379,49 @@ func (s *Store) Mkdir(parent uint64, name string, mode Mode, uid, gid uint32) (N
 	if err := validName(name); err != nil {
 		return Node{}, err
 	}
-	var n Node
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		if err := requireDirTx(tx, parent); err != nil {
-			return err
-		}
-		if tx.Bucket(bucketDirents).Get(direntKey(parent, name)) != nil {
-			return ErrExist
-		}
-		id, err := allocInodeTx(tx)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UnixNano()
-		n = Node{
-			Inode: id,
-			Mode:  ModeDir | (mode & PermMask),
-			Nlink: 2,
-			UID:   uid,
-			GID:   gid,
-			Mtime: now, Ctime: now, Atime: now,
-		}
-		if err := tx.Bucket(bucketNodes).Put(inodeKey(id), encodeNode(n)); err != nil {
-			return err
-		}
-		var cb [8]byte
-		binary.BigEndian.PutUint64(cb[:], id)
-		if err := tx.Bucket(bucketDirents).Put(direntKey(parent, name), cb[:]); err != nil {
-			return err
-		}
-		return bumpParentNlinkTx(tx, parent, +1)
-	})
+	parentNode, err := s.Stat(parent)
 	if err != nil {
+		return Node{}, err
+	}
+	if !parentNode.Mode.IsDir() {
+		return Node{}, ErrNotDir
+	}
+	if _, ok, err := s.readDirent(parent, name); err != nil {
+		return Node{}, err
+	} else if ok {
+		return Node{}, ErrExist
+	}
+	b := s.db.NewBatch()
+	id, err := s.allocInode(b)
+	if err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	now := time.Now().UnixNano()
+	n := Node{
+		Inode: id,
+		Mode:  ModeDir | (mode & PermMask),
+		Nlink: 2,
+		UID:   uid,
+		GID:   gid,
+		Mtime: now, Ctime: now, Atime: now,
+	}
+	if err := b.Set(kv.NodeKey(id), encodeNode(n)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Set(kv.DirentKey(parent, name), direntValue(id)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	// Bump parent nlink (one more directory child).
+	parentNode.Nlink++
+	parentNode.Ctime = now
+	if err := b.Set(kv.NodeKey(parent), encodeNode(parentNode)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Commit(true); err != nil {
 		return Node{}, err
 	}
 	return n, nil
@@ -423,37 +433,43 @@ func (s *Store) Symlink(parent uint64, name, target string, uid, gid uint32) (No
 	if err := validName(name); err != nil {
 		return Node{}, err
 	}
-	var n Node
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		if err := requireDirTx(tx, parent); err != nil {
-			return err
-		}
-		if tx.Bucket(bucketDirents).Get(direntKey(parent, name)) != nil {
-			return ErrExist
-		}
-		id, err := allocInodeTx(tx)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UnixNano()
-		n = Node{
-			Inode:         id,
-			Mode:          ModeSymlink | 0o777,
-			Nlink:         1,
-			UID:           uid,
-			GID:           gid,
-			Size:          int64(len(target)),
-			Mtime:         now, Ctime: now, Atime: now,
-			SymlinkTarget: target,
-		}
-		if err := tx.Bucket(bucketNodes).Put(inodeKey(id), encodeNode(n)); err != nil {
-			return err
-		}
-		var cb [8]byte
-		binary.BigEndian.PutUint64(cb[:], id)
-		return tx.Bucket(bucketDirents).Put(direntKey(parent, name), cb[:])
-	})
-	return n, err
+	if err := s.requireDir(parent); err != nil {
+		return Node{}, err
+	}
+	if _, ok, err := s.readDirent(parent, name); err != nil {
+		return Node{}, err
+	} else if ok {
+		return Node{}, ErrExist
+	}
+	b := s.db.NewBatch()
+	id, err := s.allocInode(b)
+	if err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	now := time.Now().UnixNano()
+	n := Node{
+		Inode:         id,
+		Mode:          ModeSymlink | 0o777,
+		Nlink:         1,
+		UID:           uid,
+		GID:           gid,
+		Size:          int64(len(target)),
+		Mtime:         now, Ctime: now, Atime: now,
+		SymlinkTarget: target,
+	}
+	if err := b.Set(kv.NodeKey(id), encodeNode(n)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Set(kv.DirentKey(parent, name), direntValue(id)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Commit(true); err != nil {
+		return Node{}, err
+	}
+	return n, nil
 }
 
 // Readlink returns the target string of a symlink inode.
@@ -473,39 +489,36 @@ func (s *Store) Link(targetInode, newParent uint64, newName string) (Node, error
 	if err := validName(newName); err != nil {
 		return Node{}, err
 	}
-	var n Node
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNodes).Get(inodeKey(targetInode))
-		if v == nil {
-			return ErrNotExist
-		}
-		tn, err := decodeNode(v)
-		if err != nil {
-			return err
-		}
-		if tn.Mode.IsDir() {
-			return syscall.EPERM // POSIX disallows directory hardlinks
-		}
-		if err := requireDirTx(tx, newParent); err != nil {
-			return err
-		}
-		if tx.Bucket(bucketDirents).Get(direntKey(newParent, newName)) != nil {
-			return ErrExist
-		}
-		tn.Nlink++
-		tn.Ctime = time.Now().UnixNano()
-		if err := tx.Bucket(bucketNodes).Put(inodeKey(targetInode), encodeNode(tn)); err != nil {
-			return err
-		}
-		var cb [8]byte
-		binary.BigEndian.PutUint64(cb[:], targetInode)
-		if err := tx.Bucket(bucketDirents).Put(direntKey(newParent, newName), cb[:]); err != nil {
-			return err
-		}
-		n = tn
-		return nil
-	})
-	return n, err
+	tn, err := s.Stat(targetInode)
+	if err != nil {
+		return Node{}, err
+	}
+	if tn.Mode.IsDir() {
+		return Node{}, syscall.EPERM // POSIX disallows directory hardlinks
+	}
+	if err := s.requireDir(newParent); err != nil {
+		return Node{}, err
+	}
+	if _, ok, err := s.readDirent(newParent, newName); err != nil {
+		return Node{}, err
+	} else if ok {
+		return Node{}, ErrExist
+	}
+	tn.Nlink++
+	tn.Ctime = time.Now().UnixNano()
+	b := s.db.NewBatch()
+	if err := b.Set(kv.NodeKey(targetInode), encodeNode(tn)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Set(kv.DirentKey(newParent, newName), direntValue(targetInode)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Commit(true); err != nil {
+		return Node{}, err
+	}
+	return tn, nil
 }
 
 // --- unlink / rmdir / rename --------------------------------------------
@@ -516,42 +529,41 @@ func (s *Store) Unlink(parent uint64, name string) error {
 	if err := validName(name); err != nil {
 		return err
 	}
-	var freeInode uint64
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		dv := tx.Bucket(bucketDirents).Get(direntKey(parent, name))
-		if dv == nil {
-			return ErrNotExist
-		}
-		child := binary.BigEndian.Uint64(dv)
-		nv := tx.Bucket(bucketNodes).Get(inodeKey(child))
-		if nv == nil {
-			return fmt.Errorf("store: dangling dirent %d/%q", parent, name)
-		}
-		n, err := decodeNode(nv)
-		if err != nil {
-			return err
-		}
-		if n.Mode.IsDir() {
-			return ErrIsDir
-		}
-		if err := tx.Bucket(bucketDirents).Delete(direntKey(parent, name)); err != nil {
-			return err
-		}
-		n.Nlink--
-		n.Ctime = time.Now().UnixNano()
-		if n.Nlink == 0 {
-			freeInode = child
-			if err := tx.Bucket(bucketNodes).Delete(inodeKey(child)); err != nil {
-				return err
-			}
-		} else {
-			if err := tx.Bucket(bucketNodes).Put(inodeKey(child), encodeNode(n)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	child, ok, err := s.readDirent(parent, name)
 	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotExist
+	}
+	n, err := s.Stat(child)
+	if err != nil {
+		return fmt.Errorf("store: dangling dirent %d/%q", parent, name)
+	}
+	if n.Mode.IsDir() {
+		return ErrIsDir
+	}
+	b := s.db.NewBatch()
+	if err := b.Delete(kv.DirentKey(parent, name)); err != nil {
+		b.Close()
+		return err
+	}
+	n.Nlink--
+	n.Ctime = time.Now().UnixNano()
+	var freeInode uint64
+	if n.Nlink == 0 {
+		freeInode = child
+		if err := b.Delete(kv.NodeKey(child)); err != nil {
+			b.Close()
+			return err
+		}
+	} else {
+		if err := b.Set(kv.NodeKey(child), encodeNode(n)); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	if err := b.Commit(true); err != nil {
 		return err
 	}
 	if freeInode != 0 {
@@ -560,42 +572,64 @@ func (s *Store) Unlink(parent uint64, name string) error {
 	return nil
 }
 
+// hasDirentChildren reports whether any dirent exists under parent. Used
+// for the "directory must be empty" precondition on Rmdir/Rename.
+func (s *Store) hasDirentChildren(parent uint64) (bool, error) {
+	prefix := kv.DirentPrefix(parent)
+	it, err := s.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return false, err
+	}
+	defer it.Close()
+	return it.First(), nil
+}
+
 // Rmdir removes an empty directory entry.
 func (s *Store) Rmdir(parent uint64, name string) error {
 	if err := validName(name); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		dv := tx.Bucket(bucketDirents).Get(direntKey(parent, name))
-		if dv == nil {
-			return ErrNotExist
-		}
-		child := binary.BigEndian.Uint64(dv)
-		nv := tx.Bucket(bucketNodes).Get(inodeKey(child))
-		if nv == nil {
-			return fmt.Errorf("store: dangling dirent %d/%q", parent, name)
-		}
-		n, err := decodeNode(nv)
-		if err != nil {
-			return err
-		}
-		if !n.Mode.IsDir() {
-			return ErrNotDir
-		}
-		// Empty check: any dirents under this inode?
-		c := tx.Bucket(bucketDirents).Cursor()
-		k, _ := c.Seek(parentPrefix(child))
-		if k != nil && bytes.HasPrefix(k, parentPrefix(child)) {
-			return ErrNotEmpty
-		}
-		if err := tx.Bucket(bucketDirents).Delete(direntKey(parent, name)); err != nil {
-			return err
-		}
-		if err := tx.Bucket(bucketNodes).Delete(inodeKey(child)); err != nil {
-			return err
-		}
-		return bumpParentNlinkTx(tx, parent, -1)
-	})
+	child, ok, err := s.readDirent(parent, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotExist
+	}
+	n, err := s.Stat(child)
+	if err != nil {
+		return fmt.Errorf("store: dangling dirent %d/%q", parent, name)
+	}
+	if !n.Mode.IsDir() {
+		return ErrNotDir
+	}
+	hasChildren, err := s.hasDirentChildren(child)
+	if err != nil {
+		return err
+	}
+	if hasChildren {
+		return ErrNotEmpty
+	}
+	parentNode, err := s.Stat(parent)
+	if err != nil {
+		return err
+	}
+	parentNode.Nlink--
+	parentNode.Ctime = time.Now().UnixNano()
+	b := s.db.NewBatch()
+	if err := b.Delete(kv.DirentKey(parent, name)); err != nil {
+		b.Close()
+		return err
+	}
+	if err := b.Delete(kv.NodeKey(child)); err != nil {
+		b.Close()
+		return err
+	}
+	if err := b.Set(kv.NodeKey(parent), encodeNode(parentNode)); err != nil {
+		b.Close()
+		return err
+	}
+	return b.Commit(true)
 }
 
 // Rename moves (oldParent, oldName) to (newParent, newName). If the target
@@ -610,110 +644,197 @@ func (s *Store) Rename(oldParent uint64, oldName string, newParent uint64, newNa
 	}
 	s.openMu.Lock()
 	defer s.openMu.Unlock()
-	var freeInode uint64
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		dd := tx.Bucket(bucketDirents)
-		nodes := tx.Bucket(bucketNodes)
 
-		srcVal := dd.Get(direntKey(oldParent, oldName))
-		if srcVal == nil {
-			return ErrNotExist
+	srcInode, ok, err := s.readDirent(oldParent, oldName)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotExist
+	}
+	srcNode, err := s.Stat(srcInode)
+	if err != nil {
+		return fmt.Errorf("store: dangling src dirent")
+	}
+	if err := s.requireDir(newParent); err != nil {
+		return err
+	}
+
+	// Prevent moving a directory into its own subtree (cycle).
+	if srcNode.Mode.IsDir() {
+		if newParent == srcInode {
+			return ErrInvalid
 		}
-		srcInode := binary.BigEndian.Uint64(srcVal)
-		srcNodeV := nodes.Get(inodeKey(srcInode))
-		if srcNodeV == nil {
-			return fmt.Errorf("store: dangling src dirent")
-		}
-		srcNode, err := decodeNode(srcNodeV)
+		isDesc, err := s.isDescendant(newParent, srcInode)
 		if err != nil {
 			return err
 		}
-
-		if err := requireDirTx(tx, newParent); err != nil {
-			return err
-		}
-
-		// Prevent moving a directory into its own subtree (cycle).
-		if srcNode.Mode.IsDir() && (newParent == srcInode || isDescendantTx(tx, newParent, srcInode)) {
+		if isDesc {
 			return ErrInvalid
 		}
+	}
 
-		// Handle target.
-		if dstVal := dd.Get(direntKey(newParent, newName)); dstVal != nil {
-			dstInode := binary.BigEndian.Uint64(dstVal)
-			if dstInode == srcInode {
-				// Renaming to itself: no-op.
-				return nil
+	b := s.db.NewBatch()
+	var freeInode uint64
+
+	if dstInode, ok, err := s.readDirent(newParent, newName); err != nil {
+		b.Close()
+		return err
+	} else if ok {
+		if dstInode == srcInode {
+			// Renaming to itself: no-op.
+			b.Close()
+			return nil
+		}
+		dstNode, err := s.Stat(dstInode)
+		if err != nil {
+			b.Close()
+			return fmt.Errorf("store: dangling dst dirent")
+		}
+		if srcNode.Mode.IsDir() != dstNode.Mode.IsDir() {
+			b.Close()
+			if srcNode.Mode.IsDir() {
+				return ErrNotDir
 			}
-			dstNodeV := nodes.Get(inodeKey(dstInode))
-			if dstNodeV == nil {
-				return fmt.Errorf("store: dangling dst dirent")
-			}
-			dstNode, err := decodeNode(dstNodeV)
+			return ErrIsDir
+		}
+		if dstNode.Mode.IsDir() {
+			hasChildren, err := s.hasDirentChildren(dstInode)
 			if err != nil {
+				b.Close()
 				return err
 			}
-			// Type compatibility.
-			if srcNode.Mode.IsDir() != dstNode.Mode.IsDir() {
-				if srcNode.Mode.IsDir() {
-					return ErrNotDir
-				}
-				return ErrIsDir
+			if hasChildren {
+				b.Close()
+				return ErrNotEmpty
 			}
-			if dstNode.Mode.IsDir() {
-				// Must be empty.
-				c := dd.Cursor()
-				k, _ := c.Seek(parentPrefix(dstInode))
-				if k != nil && bytes.HasPrefix(k, parentPrefix(dstInode)) {
-					return ErrNotEmpty
-				}
-				if err := nodes.Delete(inodeKey(dstInode)); err != nil {
-					return err
-				}
-				if err := bumpParentNlinkTx(tx, newParent, -1); err != nil {
+			if err := b.Delete(kv.NodeKey(dstInode)); err != nil {
+				b.Close()
+				return err
+			}
+			// New parent's nlink decreases (its dir-child went away).
+			np, err := s.Stat(newParent)
+			if err != nil {
+				b.Close()
+				return err
+			}
+			np.Nlink--
+			np.Ctime = time.Now().UnixNano()
+			if err := b.Set(kv.NodeKey(newParent), encodeNode(np)); err != nil {
+				b.Close()
+				return err
+			}
+		} else {
+			dstNode.Nlink--
+			dstNode.Ctime = time.Now().UnixNano()
+			if dstNode.Nlink == 0 {
+				freeInode = dstInode
+				if err := b.Delete(kv.NodeKey(dstInode)); err != nil {
+					b.Close()
 					return err
 				}
 			} else {
-				dstNode.Nlink--
-				dstNode.Ctime = time.Now().UnixNano()
-				if dstNode.Nlink == 0 {
-					freeInode = dstInode
-					if err := nodes.Delete(inodeKey(dstInode)); err != nil {
-						return err
-					}
-				} else {
-					if err := nodes.Put(inodeKey(dstInode), encodeNode(dstNode)); err != nil {
-						return err
-					}
+				if err := b.Set(kv.NodeKey(dstInode), encodeNode(dstNode)); err != nil {
+					b.Close()
+					return err
 				}
 			}
 		}
+	}
 
-		// Apply the move.
-		if err := dd.Delete(direntKey(oldParent, oldName)); err != nil {
+	// Apply the move.
+	if err := b.Delete(kv.DirentKey(oldParent, oldName)); err != nil {
+		b.Close()
+		return err
+	}
+	if err := b.Set(kv.DirentKey(newParent, newName), direntValue(srcInode)); err != nil {
+		b.Close()
+		return err
+	}
+	// nlink for parent dirs (if src is a directory and parents differ).
+	if srcNode.Mode.IsDir() && oldParent != newParent {
+		op, err := s.Stat(oldParent)
+		if err != nil {
+			b.Close()
 			return err
 		}
-		if err := dd.Put(direntKey(newParent, newName), srcVal); err != nil {
+		op.Nlink--
+		op.Ctime = time.Now().UnixNano()
+		if err := b.Set(kv.NodeKey(oldParent), encodeNode(op)); err != nil {
+			b.Close()
 			return err
 		}
-		// nlink for parent dirs (if src is a directory and parents differ).
-		if srcNode.Mode.IsDir() && oldParent != newParent {
-			if err := bumpParentNlinkTx(tx, oldParent, -1); err != nil {
-				return err
-			}
-			if err := bumpParentNlinkTx(tx, newParent, +1); err != nil {
-				return err
-			}
+		np, err := s.Stat(newParent)
+		if err != nil {
+			b.Close()
+			return err
 		}
-		return nil
-	})
-	if err != nil {
+		np.Nlink++
+		np.Ctime = time.Now().UnixNano()
+		if err := b.Set(kv.NodeKey(newParent), encodeNode(np)); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	if err := b.Commit(true); err != nil {
 		return err
 	}
 	if freeInode != 0 {
 		return s.idx.DeleteInode(freeInode)
 	}
 	return nil
+}
+
+// isDescendant returns true if candidate lives somewhere underneath root.
+// Used by Rename to refuse cycle-creating moves like rename(/a, /a/b/c).
+// O(N) in dirent count; only invoked when renaming directories.
+func (s *Store) isDescendant(candidate, root uint64) (bool, error) {
+	cur := candidate
+	for i := 0; i < 1000 && cur != RootInode; i++ {
+		parent, ok, err := s.findParent(cur)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		if parent == root {
+			return true, nil
+		}
+		cur = parent
+	}
+	return false, nil
+}
+
+// findParent scans every dirent looking for one whose value matches inode,
+// returning the parent embedded in the key. Linear in total dirent count,
+// run only at rename time — fine.
+func (s *Store) findParent(inode uint64) (uint64, bool, error) {
+	want := direntValue(inode)
+	prefix := []byte{'d'} // kv.tagDirent — full dirent space
+	it, err := s.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return 0, false, err
+	}
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		if equalBytes(it.Value(), want) {
+			return kv.DirentParentFromKey(it.Key()), true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // --- attrs --------------------------------------------------------------
@@ -740,170 +861,87 @@ type SetAttr struct {
 // (silent zero-fill).
 func (s *Store) Setattr(inode uint64, sa SetAttr) (Node, error) {
 	if sa.Size != nil {
-		var curSize int64
-		if err := s.db.View(func(tx *bolt.Tx) error {
-			nv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
-			if nv == nil {
-				return ErrNotExist
-			}
-			nn, err := decodeNode(nv)
-			if err != nil {
-				return err
-			}
-			curSize = nn.Size
-			return nil
-		}); err != nil {
+		cur, err := s.Stat(inode)
+		if err != nil {
 			return Node{}, err
 		}
-		if *sa.Size < curSize {
+		if *sa.Size < cur.Size {
 			if err := s.idx.Truncate(inode, *sa.Size); err != nil {
 				return Node{}, err
 			}
 		}
 	}
-	var n Node
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		nv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
-		if nv == nil {
-			return ErrNotExist
-		}
-		nn, err := decodeNode(nv)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UnixNano()
-		if sa.Mode != nil {
-			nn.Mode = (nn.Mode & ModeMask) | (*sa.Mode & PermMask)
-		}
-		if sa.UID != nil {
-			nn.UID = *sa.UID
-		}
-		if sa.GID != nil {
-			nn.GID = *sa.GID
-		}
-		if sa.Mtime != nil {
-			nn.Mtime = *sa.Mtime
-		}
-		if sa.Atime != nil {
-			nn.Atime = *sa.Atime
-		}
-		if sa.Size != nil {
-			nn.Size = *sa.Size
-		}
-		nn.Ctime = now
-		if err := tx.Bucket(bucketNodes).Put(inodeKey(inode), encodeNode(nn)); err != nil {
-			return err
-		}
-		n = nn
-		return nil
-	})
+	nn, err := s.Stat(inode)
 	if err != nil {
 		return Node{}, err
 	}
-	return n, nil
+	now := time.Now().UnixNano()
+	if sa.Mode != nil {
+		nn.Mode = (nn.Mode & ModeMask) | (*sa.Mode & PermMask)
+	}
+	if sa.UID != nil {
+		nn.UID = *sa.UID
+	}
+	if sa.GID != nil {
+		nn.GID = *sa.GID
+	}
+	if sa.Mtime != nil {
+		nn.Mtime = *sa.Mtime
+	}
+	if sa.Atime != nil {
+		nn.Atime = *sa.Atime
+	}
+	if sa.Size != nil {
+		nn.Size = *sa.Size
+	}
+	nn.Ctime = now
+	b := s.db.NewBatch()
+	if err := b.Set(kv.NodeKey(inode), encodeNode(nn)); err != nil {
+		b.Close()
+		return Node{}, err
+	}
+	if err := b.Commit(true); err != nil {
+		return Node{}, err
+	}
+	return nn, nil
 }
 
 // --- readdir ------------------------------------------------------------
 
 // Readdir returns the children of a directory.
 func (s *Store) Readdir(inode uint64) ([]DirEntry, error) {
+	dn, err := s.Stat(inode)
+	if err != nil {
+		return nil, err
+	}
+	if !dn.Mode.IsDir() {
+		return nil, ErrNotDir
+	}
+	prefix := kv.DirentPrefix(inode)
+	it, err := s.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
 	var out []DirEntry
-	err := s.db.View(func(tx *bolt.Tx) error {
-		dv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
-		if dv == nil {
-			return ErrNotExist
+	for it.First(); it.Valid(); it.Next() {
+		name := kv.DirentNameFromKey(it.Key())
+		v := it.Value()
+		if len(v) != 8 {
+			continue
 		}
-		dn, err := decodeNode(dv)
+		childInode := binary.BigEndian.Uint64(v)
+		// Read the child node. A short scan calling Stat per entry is
+		// fine here — Pebble Get on hot metadata is sub-µs from the
+		// block cache, and readdir is not a hot path.
+		cn, err := s.Stat(childInode)
 		if err != nil {
-			return err
+			// Skip dangling entries rather than failing readdir.
+			continue
 		}
-		if !dn.Mode.IsDir() {
-			return ErrNotDir
-		}
-		c := tx.Bucket(bucketDirents).Cursor()
-		prefix := parentPrefix(inode)
-		nodes := tx.Bucket(bucketNodes)
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			name := string(k[8:])
-			childInode := binary.BigEndian.Uint64(v)
-			nv := nodes.Get(inodeKey(childInode))
-			if nv == nil {
-				// Skip dangling entries rather than failing readdir.
-				continue
-			}
-			cn, err := decodeNode(nv)
-			if err != nil {
-				return err
-			}
-			out = append(out, DirEntry{Name: name, Inode: childInode, Mode: cn.Mode})
-		}
-		return nil
-	})
-	return out, err
-}
-
-// --- internal helpers used in txs ---------------------------------------
-
-func requireDirTx(tx *bolt.Tx, inode uint64) error {
-	nv := tx.Bucket(bucketNodes).Get(inodeKey(inode))
-	if nv == nil {
-		return ErrNotExist
+		out = append(out, DirEntry{Name: name, Inode: childInode, Mode: cn.Mode})
 	}
-	n, err := decodeNode(nv)
-	if err != nil {
-		return err
-	}
-	if !n.Mode.IsDir() {
-		return ErrNotDir
-	}
-	return nil
-}
-
-func bumpParentNlinkTx(tx *bolt.Tx, parent uint64, delta int32) error {
-	nv := tx.Bucket(bucketNodes).Get(inodeKey(parent))
-	if nv == nil {
-		return ErrNotExist
-	}
-	n, err := decodeNode(nv)
-	if err != nil {
-		return err
-	}
-	n.Nlink = uint32(int32(n.Nlink) + delta)
-	n.Ctime = time.Now().UnixNano()
-	return tx.Bucket(bucketNodes).Put(inodeKey(parent), encodeNode(n))
-}
-
-// isDescendantTx returns true if `candidate` lives somewhere underneath
-// `root` in the directory tree. Used by Rename to refuse cycle-creating
-// moves like rename(/a, /a/b/c).
-func isDescendantTx(tx *bolt.Tx, candidate, root uint64) bool {
-	// Walk ancestors of candidate by scanning dirents for back-pointers.
-	// We don't store parent links explicitly, so iterate. This is O(N) in
-	// the dirent count, run only at rename time — fine for simplicity.
-	cur := candidate
-	for i := 0; i < 1000 && cur != RootInode; i++ {
-		parent, ok := findParentTx(tx, cur)
-		if !ok {
-			return false
-		}
-		if parent == root {
-			return true
-		}
-		cur = parent
-	}
-	return false
-}
-
-func findParentTx(tx *bolt.Tx, inode uint64) (uint64, bool) {
-	c := tx.Bucket(bucketDirents).Cursor()
-	want := make([]byte, 8)
-	binary.BigEndian.PutUint64(want, inode)
-	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if bytes.Equal(v, want) {
-			return binary.BigEndian.Uint64(k[:8]), true
-		}
-	}
-	return 0, false
+	return out, nil
 }
 
 // OpenInode returns a Handle to an existing inode. flags is reserved for
@@ -925,9 +963,9 @@ func (s *Store) Statfs() (Statfs, error) {
 		return Statfs{}, err
 	}
 	return Statfs{
-		BlockSize:  uint32(st.Bsize),
-		Blocks:     st.Blocks,
-		BlocksFree: st.Bfree,
+		BlockSize:   uint32(st.Bsize),
+		Blocks:      st.Blocks,
+		BlocksFree:  st.Bfree,
 		BlocksAvail: st.Bavail,
 	}, nil
 }

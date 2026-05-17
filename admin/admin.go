@@ -20,7 +20,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
-	"os"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -176,8 +175,8 @@ func metricsHandler(deps Deps) http.HandlerFunc {
 		// --- disk space ---
 		writeDiskGauges(&b, deps.Index.HotDir(), deps.Index.ColdDir())
 
-		// --- bbolt ---
-		writeBboltStats(&b, deps.Index)
+		// --- pebble ---
+		writePebbleStats(&b, deps.Index)
 
 		// --- mover ---
 		if deps.Mover != nil {
@@ -267,35 +266,68 @@ func writeDiskGauges(b *strings.Builder, hotDir, coldDir string) {
 	}
 }
 
-// writeBboltStats emits bbolt DB stats: file size + a few useful tx
-// counters. bbolt's Stats() returns lifetime totals.
-func writeBboltStats(b *strings.Builder, idx *index.Index) {
-	if fi, err := os.Stat(dbPath(idx)); err == nil {
-		writeOne(b, "gauge", "placefs_bbolt_db_size_bytes",
-			"On-disk size of the bbolt database file.",
-			[]sample{{value: float64(fi.Size())}})
-	}
-	s := idx.DB().Stats()
-	writeOne(b, "counter", "placefs_bbolt_tx_total",
-		"Total bbolt transactions opened (counter).",
-		[]sample{
-			{labels: `kind="read"`, value: float64(s.TxN)},
-			{labels: `kind="write"`, value: float64(s.TxStats.GetPageCount())}, // surrogate for write activity
-		})
-	writeOne(b, "gauge", "placefs_bbolt_open_tx",
-		"Currently open bbolt read transactions.",
-		[]sample{{value: float64(s.OpenTxN)}})
-	writeOne(b, "gauge", "placefs_bbolt_free_pages",
-		"Pages on the bbolt freelist.",
-		[]sample{{value: float64(s.FreePageN)}})
-}
+// writePebbleStats emits pebble DB metrics: WAL byte counters, sstable
+// counts per level, compaction activity, block-cache hits/misses. Pebble
+// surfaces all of this via DB.Metrics(); we cherry-pick the fields most
+// useful for "is the LSM keeping up with the write rate."
+func writePebbleStats(b *strings.Builder, idx *index.Index) {
+	m := idx.DB().Pebble().Metrics()
 
-// dbPath returns the path of the bbolt file. The index doesn't expose it
-// directly, so we recompute the default location. Acceptable because the
-// admin server is best-effort observability; a missing file just omits
-// the size gauge.
-func dbPath(idx *index.Index) string {
-	return idx.HotDir() + "/.placefs/db.bolt"
+	// WAL — single sequential file, fsync'd on every Sync commit. Most
+	// of the placefs write-path cost lands here.
+	writeOne(b, "counter", "placefs_pebble_wal_bytes_written_total",
+		"Total bytes written to the pebble WAL.",
+		[]sample{{value: float64(m.WAL.BytesWritten)}})
+	writeOne(b, "gauge", "placefs_pebble_wal_files",
+		"Number of WAL files on disk (active + obsolete).",
+		[]sample{{value: float64(m.WAL.Files + m.WAL.ObsoleteFiles)}})
+	writeOne(b, "gauge", "placefs_pebble_wal_size_bytes",
+		"On-disk size of the active WAL file.",
+		[]sample{{value: float64(m.WAL.Size)}})
+
+	// Compaction — if Count is climbing while EstimatedDebt grows, the
+	// LSM is falling behind and writes will start stalling.
+	writeOne(b, "counter", "placefs_pebble_compactions_total",
+		"Total compactions run.",
+		[]sample{{value: float64(m.Compact.Count)}})
+	writeOne(b, "gauge", "placefs_pebble_compact_debt_bytes",
+		"Pebble's estimate of compaction work remaining.",
+		[]sample{{value: float64(m.Compact.EstimatedDebt)}})
+	writeOne(b, "gauge", "placefs_pebble_compact_in_progress",
+		"Compactions currently running.",
+		[]sample{{value: float64(m.Compact.NumInProgress)}})
+
+	// Flush — memtable → L0. Slow flushes cause back-pressure on writes.
+	writeOne(b, "counter", "placefs_pebble_flushes_total",
+		"Total memtable flushes.",
+		[]sample{{value: float64(m.Flush.Count)}})
+
+	// Per-level table counts. Healthy LSM keeps L0 shallow (≤4 files).
+	levelSizeSamples := make([]sample, 0, 7)
+	levelFilesSamples := make([]sample, 0, 7)
+	for i, l := range m.Levels {
+		lbl := fmt.Sprintf(`level="%d"`, i)
+		levelSizeSamples = append(levelSizeSamples, sample{labels: lbl, value: float64(l.Size)})
+		levelFilesSamples = append(levelFilesSamples, sample{labels: lbl, value: float64(l.NumFiles)})
+	}
+	writeOne(b, "gauge", "placefs_pebble_level_bytes",
+		"Bytes per LSM level.",
+		levelSizeSamples)
+	writeOne(b, "gauge", "placefs_pebble_level_files",
+		"sstable files per LSM level.",
+		levelFilesSamples)
+
+	// Block cache — cheap to surface and tells you how often metadata
+	// reads actually hit disk.
+	writeOne(b, "counter", "placefs_pebble_block_cache_hits_total",
+		"Block-cache hits.",
+		[]sample{{value: float64(m.BlockCache.Hits)}})
+	writeOne(b, "counter", "placefs_pebble_block_cache_misses_total",
+		"Block-cache misses.",
+		[]sample{{value: float64(m.BlockCache.Misses)}})
+	writeOne(b, "gauge", "placefs_pebble_block_cache_size_bytes",
+		"Bytes currently held in the block cache.",
+		[]sample{{value: float64(m.BlockCache.Size)}})
 }
 
 type sample struct {

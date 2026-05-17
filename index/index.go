@@ -1,5 +1,5 @@
 // Package index is the L2 storage engine. It owns:
-//   - the bbolt-backed range index (per-inode, per-stripe fragment lists),
+//   - the kv-backed range index (per-inode, per-stripe fragment lists),
 //   - the L1 segment substrate (private to this package),
 //   - the inode-id counter,
 //   - the Move primitive that re-canonicalizes a stripe (optionally moving
@@ -13,7 +13,6 @@ package index
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -22,11 +21,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/eliothedeman/place/kv"
 	"github.com/eliothedeman/place/obs"
 	"github.com/eliothedeman/place/segment"
-	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -58,10 +56,10 @@ const DefaultSegmentMaxSize int64 = 1 << 30
 // doesn't need to move bytes around.
 const subdir = ".placefs"
 
-var (
-	bucketMeta    = []byte("_meta")
-	bucketStripes = []byte("stripes")
-)
+// pebbleSubdir is the directory under .placefs/ that holds the pebble DB.
+// Kept separate from any legacy db.bolt file so the bbolt-to-pebble
+// migration can run with both files present.
+const pebbleSubdir = "pebble"
 
 // Config controls Index startup.
 type Config struct {
@@ -69,7 +67,7 @@ type Config struct {
 	// --hot and --cold. The index keeps its own state inside HotDir/.placefs/
 	// and ColdDir/.placefs/, leaving the rest of those directories alone.
 	HotDir, ColdDir string
-	// DBPath is the bbolt file. Defaults to HotDir/.placefs/db.bolt.
+	// DBPath is the pebble DB directory. Defaults to HotDir/.placefs/pebble/.
 	DBPath string
 	// StripeSize is the logical width of one stripe. Defaults to DefaultStripeSize.
 	StripeSize int64
@@ -78,7 +76,7 @@ type Config struct {
 
 	// Root is a test convenience: if set (and HotDir/ColdDir are not), the
 	// index treats Root/hot and Root/cold as the hot and cold directories
-	// and puts the DB at Root/.placefs/db.bolt. Production code should set
+	// and puts the DB at Root/.placefs/pebble/. Production code should set
 	// HotDir/ColdDir explicitly.
 	Root string
 }
@@ -88,15 +86,14 @@ type Index struct {
 	cfg        Config
 	stripeSize int64
 
-	db   *bolt.DB
+	db   *kv.DB
 	hot  *segment.Set
 	cold *segment.Set
 
 	// writeMu coordinates appends vs structural mutations.
 	//
 	//   - Append takes RLock: many appends run concurrently (different
-	//     stripes are fully independent; same-stripe seq collisions are
-	//     handled in the bbolt-side re-read, see appendChunk).
+	//     stripes are fully independent).
 	//   - Move / Truncate / DeleteInode / BulkSession.Commit take Lock:
 	//     they need exclusive access because they snapshot fragment
 	//     state and assume nothing changes underneath them.
@@ -105,6 +102,28 @@ type Index struct {
 	// qbittorrent issue many simultaneous writes from different connections,
 	// and a single Mutex turns them into a serial queue waiting on fsync.
 	writeMu sync.RWMutex
+
+	// commitLocks serializes the read-merge-write phase of concurrent
+	// appends targeting the same inode. bbolt's Batch gave us implicit
+	// serialization (one tx at a time, in-tx re-read); pebble batches
+	// run independently, so two appenders that both read "same existing
+	// state" would each write back the merged-with-only-their-fragments
+	// blob and lose each other's updates.
+	//
+	// Per-inode striping keeps cross-inode concurrency (the common
+	// workload — many files, many writers) while sequentializing the
+	// rare same-inode case. The pool is small + hashed; collisions just
+	// add a touch of pessimistic locking, never correctness loss.
+	commitLocks [numCommitLocks]sync.Mutex
+}
+
+// numCommitLocks is the size of the per-inode commit-lock pool. A power
+// of two so the hash is a mask. 256 is more than enough for typical FUSE
+// loads (rarely more than a handful of concurrently-written files).
+const numCommitLocks = 256
+
+func (idx *Index) commitLockFor(inode uint64) *sync.Mutex {
+	return &idx.commitLocks[inode&(numCommitLocks-1)]
 }
 
 // Open creates or opens the index on the given hot/cold directories.
@@ -139,42 +158,18 @@ func Open(cfg Config) (*Index, error) {
 		return nil, err
 	}
 	if cfg.DBPath == "" {
-		cfg.DBPath = filepath.Join(hotSubdir, "db.bolt")
+		cfg.DBPath = filepath.Join(hotSubdir, pebbleSubdir)
 	}
-	// FreelistType = MapType: the default ArrayType is O(N) in the number
-	// of free pages, which gets pathological for DBs that churn pages
-	// (every stripe rewrite frees old leaves). MapType is O(log N) and
-	// makes a much bigger difference than the docs imply once the DB has
-	// been running for a while.
-	//
-	// NoFreelistSync = true: bbolt's commit normally fsyncs the freelist
-	// page tree separately from the data pages. With NoFreelistSync the
-	// freelist is reconstructed at next Open by scanning the DB — adds
-	// a few hundred ms to startup on a multi-GB DB but removes one fsync
-	// per write tx, which is the win that matters under load.
-	dbOpts := *bolt.DefaultOptions
-	dbOpts.FreelistType = bolt.FreelistMapType
-	dbOpts.NoFreelistSync = true
-	db, err := bolt.Open(cfg.DBPath, 0o600, &dbOpts)
-	if err != nil {
-		return nil, err
+	// Migrate from legacy bbolt format if a db.bolt exists alongside the
+	// new pebble directory. Idempotent — does nothing when the pebble DB
+	// already exists. We invoke it here rather than at the main() layer
+	// so packaging tests + the placefs binary share the migration path.
+	legacyBolt := filepath.Join(hotSubdir, "db.bolt")
+	if err := kv.MigrateFromBolt(legacyBolt, cfg.DBPath, nil); err != nil && !errors.Is(err, kv.ErrAlreadyMigrated) {
+		return nil, fmt.Errorf("index: migrate legacy bbolt: %w", err)
 	}
-	// Default MaxBatchDelay is 10 ms — a deterministic floor on every
-	// db.Batch call when no other goroutine joins the batch. With one
-	// or two concurrent FUSE writers we sit at that floor on every
-	// fragment commit. 2 ms still gives concurrent callers a window to
-	// coalesce without dominating per-write latency.
-	db.MaxBatchDelay = 2 * time.Millisecond
-	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketMeta, bucketStripes} {
-			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	db, err := kv.Open(cfg.DBPath)
 	if err != nil {
-		db.Close()
 		return nil, err
 	}
 	hot, err := segment.OpenSet(filepath.Join(hotSubdir, "segments"), segment.TierHot, cfg.SegmentMaxSize)
@@ -233,25 +228,10 @@ func (idx *Index) Close() error {
 // StripeSize returns the configured stripe width.
 func (idx *Index) StripeSize() int64 { return idx.stripeSize }
 
-// DB exposes the underlying bbolt DB for layers above (L4 uses it for its
-// own buckets so the whole filesystem stays in a single durable DB). L2's
-// own buckets are off-limits to other layers.
-func (idx *Index) DB() *bolt.DB { return idx.db }
-
-// stripeKey returns the bbolt key for (inode, stripe). Big-endian so cursor
-// order matches numeric order — handy for prefix scans by inode.
-func stripeKey(inode uint64, stripeID uint32) []byte {
-	var k [12]byte
-	binary.BigEndian.PutUint64(k[0:], inode)
-	binary.BigEndian.PutUint32(k[8:], stripeID)
-	return k[:]
-}
-
-func inodePrefix(inode uint64) []byte {
-	var k [8]byte
-	binary.BigEndian.PutUint64(k[:], inode)
-	return k[:]
-}
+// DB exposes the underlying kv handle for layers above (L4 uses it for its
+// own keys so the whole filesystem stays in a single durable DB). L2's
+// own key prefixes are off-limits to other layers.
+func (idx *Index) DB() *kv.DB { return idx.db }
 
 func (idx *Index) stripeOf(logicalOff int64) uint32 {
 	return uint32(logicalOff / idx.stripeSize)
@@ -273,7 +253,7 @@ func (idx *Index) Append(inode uint64, logicalOff int64, payload []byte) error {
 
 // AppendCtx is the ctx-aware variant of Append. Spans started inside the
 // call hang off ctx so a single FUSE write shows the full breakdown
-// (segment append + fsync + bbolt commit) in one trace.
+// (segment append + fsync + pebble commit) in one trace.
 func (idx *Index) AppendCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte) error {
 	return idx.AppendToCtx(ctx, inode, logicalOff, payload, segment.TierHot)
 }
@@ -283,11 +263,10 @@ func (idx *Index) AppendCtx(ctx context.Context, inode uint64, logicalOff int64,
 // migration doesn't fill up the (typically smaller) hot drive.
 //
 // The flow per chunk: take writeMu, write the framed record to the active
-// segment of the chosen tier, fsync the segment, then in a bbolt write tx
-// allocate a fresh per-stripe seq and append the Fragment to the stripe's
-// list. If the bbolt tx fails for any reason, the bytes in the segment
-// become orphans and GC will reclaim them — the index never holds a
-// fragment pointing at non-durable bytes.
+// segment of the chosen tier, fsync the segment, then in a single pebble
+// batch write every fragment record. If the commit fails for any reason,
+// the bytes in the segment become orphans and GC will reclaim them — the
+// index never holds a fragment pointing at non-durable bytes.
 func (idx *Index) AppendTo(inode uint64, logicalOff int64, payload []byte, tier Tier) error {
 	return idx.AppendToCtx(context.Background(), inode, logicalOff, payload, tier)
 }
@@ -298,27 +277,29 @@ func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int6
 }
 
 // AppendToWithTxCtx is AppendToCtx + an optional txHook that runs inside
-// the same bbolt write tx that commits the fragments. The hook lets a
-// caller (today: store.WriteAtTierCtx) fold an unrelated bucket update
-// — e.g. bumping the file's Size/Mtime — into the same fsync, halving
-// the bbolt commit count per logical write.
+// the same pebble batch that commits the fragments. The hook lets a
+// caller (today: store.WriteAtTierCtx) fold an unrelated key update —
+// e.g. bumping the file's Size/Mtime — into the same WAL fsync, halving
+// the commit count per logical write.
 //
-// All chunks of one call are committed in a single batch. Previously
-// each chunk paid its own db.Batch (with its own MaxBatchDelay floor
-// and its own copy-on-write page churn); a multi-stripe write therefore
-// paid N commits when one would do.
+// All chunks of one call are committed in a single batch. The batch is a
+// kv.Batch, not a bbolt.Tx; the parent DB still serves reads through the
+// hook so existing read-then-write patterns work without read-your-own-
+// writes from inside the batch.
 //
-// The hook MUST be idempotent: db.Batch may invoke fn more than once
-// if a previous batch in the group failed. Same caveat that already
-// applied to the fragment-commit fn.
-func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte, tier Tier, txHook func(*bolt.Tx) error) error {
+// Unlike the bbolt era, pebble's group commit in the WAL coalesces
+// concurrent commits automatically — there's no MaxBatchDelay floor.
+func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOff int64, payload []byte, tier Tier, txHook func(*kv.Batch) error) error {
 	if len(payload) == 0 {
 		if txHook == nil {
 			return nil
 		}
-		// Empty write with a hook still has to land the hook (e.g. an
-		// mtime-only update). One tiny batch — cheap.
-		return idx.db.Batch(txHook)
+		b := idx.db.NewBatch()
+		if err := txHook(b); err != nil {
+			b.Close()
+			return err
+		}
+		return b.Commit(true)
 	}
 	ctx, span := obs.Tracer().Start(ctx, "index.append")
 	span.SetAttributes(
@@ -331,17 +312,12 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	defer span.End()
 
 	// Hold writeMu.RLock for the whole call: every chunk's segment write
-	// happens under the same reader-section, and the single bbolt batch
+	// happens under the same reader-section, and the single pebble batch
 	// below also runs under it. Move/Truncate/DeleteInode are the only
 	// things that take the writer lock; they block all of this.
 	_, acqSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
 	idx.writeMu.RLock()
 	acqSpan.End()
-	// write_lock_held times the hold, not the wait. If a Move/Truncate
-	// is queued behind us, you'll see acqSpan ~0 µs and held = total work
-	// — which is the normal case. If the Move/Truncate ran first, acqSpan
-	// shows the wait. Together they distinguish "we waited" from "they
-	// waited on us."
 	heldCtx, heldSpan := obs.Tracer().Start(ctx, "index.write_lock_held")
 	defer func() {
 		heldSpan.End()
@@ -350,8 +326,8 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	ctx = heldCtx
 
 	// Stage every chunk: write to segment + fsync, build a pending
-	// fragment record. We do not touch bbolt yet — that's all in the
-	// single batch below.
+	// fragment record. We do not touch pebble yet — that's all in the
+	// single commit below.
 	type pending struct {
 		stripeID uint32
 		frag     Fragment
@@ -377,7 +353,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		}
 		// Seq=0 in the on-disk header: the bbolt-side Seq is assigned
 		// inside the batch below. The on-disk Seq is only consulted by
-		// the catastrophic-rebuild path; reads always come from bbolt.
+		// the catastrophic-rebuild path; reads always come from pebble.
 		appCtx, appSpan := obs.Tracer().Start(ctx, "segment.append")
 		appSpan.SetAttributes(
 			attribute.Int("bytes", len(chunk)),
@@ -423,83 +399,70 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	}
 	span.SetAttributes(attribute.Int("chunks", chunkIdx))
 
-	// One batch commits every fragment + the optional hook. db.Batch
-	// coalesces with concurrent goroutines doing their own AppendTo;
-	// the per-call cost is one tx fsync regardless of chunk count.
+	// One pebble commit covers every fragment + the optional hook.
+	// pebble.commit_fn times just our work building the batch; the gap
+	// to pebble.commit is the WAL fsync, which is the irreducible cost.
 	//
-	// Idempotency: Batch may call fn more than once if an earlier batch
-	// in the group failed. The fragment write is keyed by
-	// (Tier, SegmentID, SegmentOffset) — if a matching fragment already
-	// exists we skip it. The txHook must enforce its own idempotency.
-	batchCtx, batchSpan := obs.Tracer().Start(ctx, "bbolt.batch")
-	batchSpan.SetAttributes(attribute.Int("fragments", len(pendings)))
-	err := idx.db.Batch(func(tx *bolt.Tx) error {
-		// batch_fn is the time spent in our work (decode/encode/Put + hook).
-		// bbolt.batch - bbolt.batch_fn is everything bbolt itself does:
-		// MaxBatchDelay wait, mmap remap, freelist serialise, two fsyncs
-		// (data + meta). On this hardware the gap is the bbolt overhead
-		// that no userspace tuning can shrink.
-		_, fnSpan := obs.Tracer().Start(batchCtx, "bbolt.batch_fn")
-		// Snapshot tx stats at the end of the fn so we know the page
-		// churn this commit will fsync. These are the numbers that
-		// dictate bbolt commit cost — split/spill count and page-alloc
-		// bytes are the most useful at a glance.
-		defer func() {
-			st := tx.Stats()
-			fnSpan.SetAttributes(
-				attribute.Int64("bbolt.page_count", st.GetPageCount()),
-				attribute.Int64("bbolt.page_alloc", st.GetPageAlloc()),
-				attribute.Int64("bbolt.cursor_count", st.GetCursorCount()),
-				attribute.Int64("bbolt.node_count", st.GetNodeCount()),
-				attribute.Int64("bbolt.split", st.GetSplit()),
-				attribute.Int64("bbolt.spill", st.GetSpill()),
-				attribute.Int64("bbolt.rebalance", st.GetRebalance()),
-			)
+	// Take the per-inode commit lock before the read-merge-write so
+	// concurrent appenders to the same inode don't lose each other's
+	// fragments. The lock is held only for the duration of the batch
+	// construction + commit (which is fast — the WAL fsync coalesces in
+	// pebble's group commit across the lock boundary).
+	cl := idx.commitLockFor(inode)
+	cl.Lock()
+	defer cl.Unlock()
+	batchCtx, commitSpan := obs.Tracer().Start(ctx, "pebble.commit")
+	commitSpan.SetAttributes(attribute.Int("fragments", len(pendings)))
+	b := idx.db.NewBatch()
+	_, fnSpan := obs.Tracer().Start(batchCtx, "pebble.commit_fn")
+	// Group fragments by stripe so we read+write each stripe's blob
+	// only once even if multiple chunks landed in the same stripe.
+	byStripe := map[uint32][]Fragment{}
+	for _, p := range pendings {
+		byStripe[p.stripeID] = append(byStripe[p.stripeID], p.frag)
+	}
+	for stripeID, frags := range byStripe {
+		key := kv.StripeKey(inode, stripeID)
+		existingBytes, err := idx.db.Get(key)
+		if err != nil {
 			fnSpan.End()
-		}()
-		sb := tx.Bucket(bucketStripes)
-		// Group fragments by stripe so we read+write each stripe's blob
-		// only once even if multiple chunks landed in the same stripe
-		// (rare in practice — chunks split at stripe boundaries — but
-		// possible if a future caller passes a sub-stripe payload).
-		byStripe := map[uint32][]Fragment{}
-		for _, p := range pendings {
-			byStripe[p.stripeID] = append(byStripe[p.stripeID], p.frag)
+			commitSpan.End()
+			b.Close()
+			recordSpanError(span, err)
+			return err
 		}
-		for stripeID, frags := range byStripe {
-			key := stripeKey(inode, stripeID)
-			existing := decodeFragments(sb.Get(key))
-			var maxSeq uint64
-			for _, f := range existing {
-				if f.Seq > maxSeq {
-					maxSeq = f.Seq
-				}
-			}
-			for i := range frags {
-				skip := false
-				for _, e := range existing {
-					if e.Tier == frags[i].Tier && e.SegmentID == frags[i].SegmentID && e.SegmentOffset == frags[i].SegmentOffset {
-						skip = true
-						break
-					}
-				}
-				if skip {
-					continue
-				}
-				maxSeq++
-				frags[i].Seq = maxSeq
-				existing = append(existing, frags[i])
-			}
-			if err := sb.Put(key, encodeFragments(existing)); err != nil {
-				return err
+		existing := decodeFragments(existingBytes)
+		var maxSeq uint64
+		for _, f := range existing {
+			if f.Seq > maxSeq {
+				maxSeq = f.Seq
 			}
 		}
-		if txHook != nil {
-			return txHook(tx)
+		for i := range frags {
+			maxSeq++
+			frags[i].Seq = maxSeq
+			existing = append(existing, frags[i])
 		}
-		return nil
-	})
-	batchSpan.End()
+		if err := b.Set(key, encodeFragments(existing)); err != nil {
+			fnSpan.End()
+			commitSpan.End()
+			b.Close()
+			recordSpanError(span, err)
+			return err
+		}
+	}
+	if txHook != nil {
+		if err := txHook(b); err != nil {
+			fnSpan.End()
+			commitSpan.End()
+			b.Close()
+			recordSpanError(span, err)
+			return err
+		}
+	}
+	fnSpan.End()
+	err := b.Commit(true)
+	commitSpan.End()
 	if err != nil {
 		recordSpanError(span, err)
 	}
@@ -541,20 +504,16 @@ func (idx *Index) PlanReadCtx(ctx context.Context, inode uint64, off, length int
 	first := idx.stripeOf(off)
 	last := idx.stripeOf(off + length - 1)
 	var allFrags []Fragment
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		for s := first; s <= last; s++ {
-			v := sb.Get(stripeKey(inode, s))
-			if v == nil {
-				continue
-			}
-			allFrags = append(allFrags, decodeFragments(v)...)
+	for s := first; s <= last; s++ {
+		v, err := idx.db.Get(kv.StripeKey(inode, s))
+		if err != nil {
+			recordSpanError(span, err)
+			return nil, err
 		}
-		return nil
-	})
-	if err != nil {
-		recordSpanError(span, err)
-		return nil, err
+		if v == nil {
+			continue
+		}
+		allFrags = append(allFrags, decodeFragments(v)...)
 	}
 	plan := planRead(allFrags, off, length)
 	span.SetAttributes(attribute.Int("slices", len(plan)))
@@ -595,7 +554,7 @@ func (idx *Index) ReadAtCtx(ctx context.Context, loc Locator, p []byte) (int, er
 	return n, err
 }
 
-// BulkSession is a write session that batches segment fsyncs and bbolt
+// BulkSession is a write session that batches segment fsyncs and pebble
 // commits across many Write calls into a single Commit. Use it for
 // bulk-ingest paths (migration, restore-from-backup, etc.) where the
 // per-chunk durability the regular Append path provides is overkill —
@@ -611,8 +570,8 @@ func (idx *Index) ReadAtCtx(ctx context.Context, loc Locator, p []byte) (int, er
 //   if err := sess.Commit(); err != nil { ... }
 //
 // Commit fsyncs every segment the session touched, then commits all
-// queued fragments to bbolt in one tx. After Commit returns, the bytes
-// are durable and the index sees them.
+// queued fragments to pebble in one batch. After Commit returns, the
+// bytes are durable and the index sees them.
 type BulkSession struct {
 	idx     *Index
 	inode   uint64
@@ -663,10 +622,10 @@ func (s *BulkSession) Write(logicalOff int64, payload []byte) error {
 		if err != nil {
 			return err
 		}
-		// Seq=0 in the on-disk record header. The bbolt-side Seq is
+		// Seq=0 in the on-disk record header. The pebble-side Seq is
 		// assigned at Commit time. The on-disk Seq is only consulted by
 		// the catastrophic-recovery rebuild path, which we'll address
-		// separately if it ever matters; index reads always use bbolt.
+		// separately if it ever matters; index reads always use pebble.
 		payloadOff, err := seg.Append(segment.RecordHeader{
 			Inode: s.inode, StripeID: stripeID, Seq: 0,
 			LogicalOff: off, Length: uint32(chunkLen),
@@ -689,7 +648,7 @@ func (s *BulkSession) Write(logicalOff int64, payload []byte) error {
 }
 
 // Commit fsyncs every touched segment, then commits all queued fragments
-// to bbolt in a single write tx. After return, the index sees the bytes.
+// to pebble in a single batch. After return, the index sees the bytes.
 func (s *BulkSession) Commit() error {
 	s.idx.writeMu.Lock()
 	defer s.idx.writeMu.Unlock()
@@ -699,39 +658,43 @@ func (s *BulkSession) Commit() error {
 			return err
 		}
 	}
-	return s.idx.db.Update(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		// Group pending fragments by stripe.
-		byStripe := map[uint32][]pendingFrag{}
-		for _, pf := range s.pending {
-			byStripe[pf.stripeID] = append(byStripe[pf.stripeID], pf)
+	b := s.idx.db.NewBatch()
+	// Group pending fragments by stripe.
+	byStripe := map[uint32][]pendingFrag{}
+	for _, pf := range s.pending {
+		byStripe[pf.stripeID] = append(byStripe[pf.stripeID], pf)
+	}
+	for stripeID, frags := range byStripe {
+		key := kv.StripeKey(s.inode, stripeID)
+		existingBytes, err := s.idx.db.Get(key)
+		if err != nil {
+			b.Close()
+			return err
 		}
-		for stripeID, frags := range byStripe {
-			key := stripeKey(s.inode, stripeID)
-			existing := decodeFragments(sb.Get(key))
-			var maxSeq uint64
-			for _, f := range existing {
-				if f.Seq > maxSeq {
-					maxSeq = f.Seq
-				}
-			}
-			for _, pf := range frags {
-				maxSeq++
-				existing = append(existing, Fragment{
-					Seq:           maxSeq,
-					LogicalOff:    pf.logicalOff,
-					Length:        pf.length,
-					Tier:          s.tier,
-					SegmentID:     pf.segmentID,
-					SegmentOffset: pf.segmentOffset,
-				})
-			}
-			if err := sb.Put(key, encodeFragments(existing)); err != nil {
-				return err
+		existing := decodeFragments(existingBytes)
+		var maxSeq uint64
+		for _, f := range existing {
+			if f.Seq > maxSeq {
+				maxSeq = f.Seq
 			}
 		}
-		return nil
-	})
+		for _, pf := range frags {
+			maxSeq++
+			existing = append(existing, Fragment{
+				Seq:           maxSeq,
+				LogicalOff:    pf.logicalOff,
+				Length:        pf.length,
+				Tier:          s.tier,
+				SegmentID:     pf.segmentID,
+				SegmentOffset: pf.segmentOffset,
+			})
+		}
+		if err := b.Set(key, encodeFragments(existing)); err != nil {
+			b.Close()
+			return err
+		}
+	}
+	return b.Commit(true)
 }
 
 // Abort discards the session. The bytes already written to segments
@@ -748,59 +711,69 @@ func (s *BulkSession) Abort() {
 func (idx *Index) Truncate(inode uint64, size int64) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
-	return idx.db.Update(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		c := sb.Cursor()
-		prefix := inodePrefix(inode)
-		// Collect keys/updates first; mutating during cursor iter is dicey.
-		type op struct {
-			key []byte
-			val []byte // nil => delete
+
+	// Collect every (key, decision) under the inode prefix, then apply
+	// in one batch. We don't mutate during iteration because pebble
+	// iterator semantics for in-flight writes vary by iterator kind, and
+	// "collect then apply" is dead simple and fast.
+	prefix := kv.StripePrefix(inode)
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return err
+	}
+	type op struct {
+		key []byte
+		val []byte // nil => delete
+	}
+	var ops []op
+	for it.First(); it.Valid(); it.Next() {
+		k := append([]byte{}, it.Key()...)
+		v := it.Value()
+		stripeID := kv.StripeIDFromKey(k)
+		stripeStart := int64(stripeID) * idx.stripeSize
+		if stripeStart >= size {
+			ops = append(ops, op{key: k})
+			continue
 		}
-		var ops []op
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			stripeID := binary.BigEndian.Uint32(k[8:])
-			stripeStart := int64(stripeID) * idx.stripeSize
-			if stripeStart >= size {
-				kc := append([]byte{}, k...)
-				ops = append(ops, op{key: kc})
+		frags := decodeFragments(v)
+		var kept []Fragment
+		for _, f := range frags {
+			if f.LogicalOff >= size {
 				continue
 			}
-			frags := decodeFragments(v)
-			var kept []Fragment
-			for _, f := range frags {
-				if f.LogicalOff >= size {
-					continue
-				}
-				end := f.LogicalOff + f.Length
-				if end > size {
-					// Clip: keep [LogicalOff, size). Note this leaves the
-					// trailing bytes in the segment as future GC fodder; the
-					// fragment record itself just stops describing them.
-					f.Length = size - f.LogicalOff
-				}
-				kept = append(kept, f)
+			end := f.LogicalOff + f.Length
+			if end > size {
+				// Clip: keep [LogicalOff, size). Trailing bytes in the
+				// segment become future GC fodder; the fragment record
+				// itself just stops describing them.
+				f.Length = size - f.LogicalOff
 			}
-			kc := append([]byte{}, k...)
-			if len(kept) == 0 {
-				ops = append(ops, op{key: kc})
-			} else {
-				ops = append(ops, op{key: kc, val: encodeFragments(kept)})
+			kept = append(kept, f)
+		}
+		if len(kept) == 0 {
+			ops = append(ops, op{key: k})
+		} else {
+			ops = append(ops, op{key: k, val: encodeFragments(kept)})
+		}
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
+	b := idx.db.NewBatch()
+	for _, o := range ops {
+		if o.val == nil {
+			if err := b.Delete(o.key); err != nil {
+				b.Close()
+				return err
+			}
+		} else {
+			if err := b.Set(o.key, o.val); err != nil {
+				b.Close()
+				return err
 			}
 		}
-		for _, o := range ops {
-			if o.val == nil {
-				if err := sb.Delete(o.key); err != nil {
-					return err
-				}
-			} else {
-				if err := sb.Put(o.key, o.val); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
+	}
+	return b.Commit(true)
 }
 
 // DeleteInode removes every fragment for inode. Bytes in segments remain
@@ -808,67 +781,74 @@ func (idx *Index) Truncate(inode uint64, size int64) error {
 func (idx *Index) DeleteInode(inode uint64) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
-	return idx.db.Update(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		c := sb.Cursor()
-		prefix := inodePrefix(inode)
-		var keys [][]byte
-		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			keys = append(keys, append([]byte{}, k...))
+	prefix := kv.StripePrefix(inode)
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return err
+	}
+	var keys [][]byte
+	for it.First(); it.Valid(); it.Next() {
+		keys = append(keys, append([]byte{}, it.Key()...))
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
+	b := idx.db.NewBatch()
+	for _, k := range keys {
+		if err := b.Delete(k); err != nil {
+			b.Close()
+			return err
 		}
-		for _, k := range keys {
-			if err := sb.Delete(k); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return b.Commit(true)
 }
 
 // StripeInfo summarises one stripe — used by L3 to pick movement candidates.
 type StripeInfo struct {
-	Inode       uint64
-	StripeID    uint32
-	HotBytes    int64
-	ColdBytes   int64
+	Inode    uint64
+	StripeID uint32
+	HotBytes int64
+	ColdBytes int64
 	// LiveBytes is the logical byte count after canonical-view shadowing.
 	// (Total HotBytes+ColdBytes can be larger if there's overlap.)
 	LiveBytes int64
 }
 
 // IterStripes calls fn for every stripe that has at least one fragment.
-// Stopping (fn returns false) ends iteration. The callback must not call
-// back into idx (would deadlock the read tx).
+// Stopping (fn returns false) ends iteration.
 func (idx *Index) IterStripes(fn func(StripeInfo) bool) error {
-	return idx.db.View(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		c := sb.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if len(k) != 12 {
-				continue
-			}
-			info := StripeInfo{
-				Inode:    binary.BigEndian.Uint64(k[0:8]),
-				StripeID: binary.BigEndian.Uint32(k[8:12]),
-			}
-			frags := decodeFragments(v)
-			for _, f := range frags {
-				switch f.Tier {
-				case segment.TierHot:
-					info.HotBytes += f.Length
-				case segment.TierCold:
-					info.ColdBytes += f.Length
-				}
-			}
-			for _, f := range canonicalView(frags) {
-				info.LiveBytes += f.Length
-			}
-			if !fn(info) {
-				return nil
+	prefix := kv.StripeAllPrefix()
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if len(k) != 13 { // tag(1) + inode(8) + stripeID(4)
+			continue
+		}
+		info := StripeInfo{
+			Inode:    kv.StripeInodeFromKey(k),
+			StripeID: kv.StripeIDFromKey(k),
+		}
+		frags := decodeFragments(it.Value())
+		for _, f := range frags {
+			switch f.Tier {
+			case segment.TierHot:
+				info.HotBytes += f.Length
+			case segment.TierCold:
+				info.ColdBytes += f.Length
 			}
 		}
-		return nil
-	})
+		for _, f := range canonicalView(frags) {
+			info.LiveBytes += f.Length
+		}
+		if !fn(info) {
+			return nil
+		}
+	}
+	return nil
 }
 
 // Move re-canonicalizes one stripe into target tier. Reads the current
@@ -882,22 +862,18 @@ func (idx *Index) IterStripes(fn func(StripeInfo) bool) error {
 // underlying bytes for GC.
 //
 // Move acquires writeMu to keep its segment IO ordered against Append.
-// The bytes to copy are read with no lock held; bbolt's tx is only opened
-// after the IO completes to make the swap atomic relative to readers.
+// The bytes to copy are read with no lock held; pebble's batch is only
+// opened after the IO completes to make the swap atomic relative to readers.
 func (idx *Index) Move(inode uint64, stripeID uint32, target Tier) error {
 	idx.writeMu.Lock()
 	defer idx.writeMu.Unlock()
 
 	// Snapshot the current fragment list.
-	var frags []Fragment
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketStripes).Get(stripeKey(inode, stripeID))
-		frags = decodeFragments(v)
-		return nil
-	})
+	v, err := idx.db.Get(kv.StripeKey(inode, stripeID))
 	if err != nil {
 		return err
 	}
+	frags := decodeFragments(v)
 	if len(frags) == 0 {
 		return nil
 	}
@@ -960,19 +936,23 @@ func (idx *Index) Move(inode uint64, stripeID uint32, target Tier) error {
 		nextSeq++
 	}
 
-	// Swap in the new list. We must re-read inside the tx to detect a
-	// concurrent Append that arrived between our snapshot and now. With
-	// writeMu held that should be impossible (Append also takes writeMu),
-	// but a defensive re-read keeps the invariant local and obvious.
-	return idx.db.Update(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		key := stripeKey(inode, stripeID)
-		current := decodeFragments(sb.Get(key))
-		if !sameFragments(current, frags) {
-			return errors.New("index: Move: concurrent modification (should not happen with writeMu held)")
-		}
-		return sb.Put(key, encodeFragments(newFrags))
-	})
+	// Swap in the new list. We hold writeMu so no Append could have
+	// raced; the defensive re-read is still cheap and keeps the
+	// invariant local and obvious.
+	currentBytes, err := idx.db.Get(kv.StripeKey(inode, stripeID))
+	if err != nil {
+		return err
+	}
+	current := decodeFragments(currentBytes)
+	if !sameFragments(current, frags) {
+		return errors.New("index: Move: concurrent modification (should not happen with writeMu held)")
+	}
+	b := idx.db.NewBatch()
+	if err := b.Set(kv.StripeKey(inode, stripeID), encodeFragments(newFrags)); err != nil {
+		b.Close()
+		return err
+	}
+	return b.Commit(true)
 }
 
 func sameFragments(a, b []Fragment) bool {
@@ -991,21 +971,22 @@ func sameFragments(a, b []Fragment) bool {
 // current write target for each tier) are always retained even if empty,
 // since they'll be written to next.
 func (idx *Index) GC() error {
-	// Build referenced-set from bbolt.
+	// Build referenced-set by scanning every stripe key.
 	referenced := map[segment.Tier]map[uint32]bool{
 		segment.TierHot:  {},
 		segment.TierCold: {},
 	}
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		sb := tx.Bucket(bucketStripes)
-		return sb.ForEach(func(k, v []byte) error {
-			for _, f := range decodeFragments(v) {
-				referenced[f.Tier][f.SegmentID] = true
-			}
-			return nil
-		})
-	})
+	prefix := kv.StripeAllPrefix()
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
 	if err != nil {
+		return err
+	}
+	for it.First(); it.Valid(); it.Next() {
+		for _, f := range decodeFragments(it.Value()) {
+			referenced[f.Tier][f.SegmentID] = true
+		}
+	}
+	if err := it.Close(); err != nil {
 		return err
 	}
 	// Preserve the active segment of each tier even if empty — it's the
@@ -1085,9 +1066,9 @@ func (idx *Index) HotUsedBytes() int64 {
 	return n
 }
 
-// Sync makes every accumulated write durable on disk (segments + bbolt).
-// Append already fsyncs the touched segment + commits the tx, so this is
-// only needed if a caller wants to force a global sync barrier.
+// Sync makes every accumulated write durable on disk (segments + pebble
+// WAL). Append already fsyncs the touched segment + commits the WAL, so
+// this is only needed if a caller wants to force a global sync barrier.
 func (idx *Index) Sync() error {
 	return idx.SyncCtx(context.Background())
 }
@@ -1104,7 +1085,12 @@ func (idx *Index) SyncCtx(ctx context.Context) error {
 		recordSpanError(span, err)
 		return err
 	}
-	if err := idx.db.Sync(); err != nil {
+	// Every Batch.Commit(true) already fsyncs the WAL, so the DB is
+	// already durable. Pebble offers no "fsync the WAL again" primitive —
+	// LogData(nil) followed by a Sync commit is the idiomatic full
+	// barrier. The cost is one extra WAL append + fsync.
+	b := idx.db.NewBatch()
+	if err := b.Commit(true); err != nil {
 		recordSpanError(span, err)
 		return err
 	}
@@ -1114,26 +1100,28 @@ func (idx *Index) SyncCtx(ctx context.Context) error {
 // FragmentsOf returns a snapshot of the fragment list for one stripe.
 // Used by tests and by L3 for inspection. Returns nil if absent.
 func (idx *Index) FragmentsOf(inode uint64, stripeID uint32) ([]Fragment, error) {
-	var out []Fragment
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketStripes).Get(stripeKey(inode, stripeID))
-		out = decodeFragments(v)
-		return nil
-	})
-	return out, err
+	v, err := idx.db.Get(kv.StripeKey(inode, stripeID))
+	if err != nil {
+		return nil, err
+	}
+	return decodeFragments(v), nil
 }
 
 // StripesOf returns every stripe id that has fragments for inode.
 func (idx *Index) StripesOf(inode uint64) ([]uint32, error) {
+	prefix := kv.StripePrefix(inode)
+	it, err := idx.db.Iter(prefix, kv.PrefixUpperBound(prefix))
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
 	var out []uint32
-	err := idx.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketStripes).Cursor()
-		prefix := inodePrefix(inode)
-		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			out = append(out, binary.BigEndian.Uint32(k[8:]))
-		}
-		return nil
-	})
+	for it.First(); it.Valid(); it.Next() {
+		out = append(out, kv.StripeIDFromKey(it.Key()))
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, err
+	return out, nil
 }
+
+// Ensure imports stay referenced when blocks are removed during edits.
+var _ = bytes.Equal

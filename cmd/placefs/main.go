@@ -29,7 +29,7 @@ func main() {
 	hot := flag.String("hot", "", "hot (fast) storage directory")
 	cold := flag.String("cold", "", "cold (slow) storage directory")
 	mountPoint := flag.String("mount", "", "FUSE mount point")
-	dbPath := flag.String("db", "", "DB path (default {hot}/.placefs/db.bolt)")
+	dbPath := flag.String("db", "", "DB directory (default {hot}/.placefs/pebble). A legacy {hot}/.placefs/db.bolt is auto-migrated on first start.")
 
 	// Byte-sized values accept human-readable suffixes (B/K/KB/KiB,
 	// M/MB/MiB, ...). All multi-char suffixes are 1024-based.
@@ -81,7 +81,7 @@ func main() {
 	logger.Info("starting", "hot", *hot, "cold", *cold, "mount", *mountPoint)
 
 	// Initialise tracing before opening any storage so spans cover the
-	// whole lifecycle including bbolt open + segment scan. shutdownTrace
+	// whole lifecycle including pebble open + segment scan. shutdownTrace
 	// is a no-op when --otel-endpoint is empty.
 	shutdownTrace, err := obs.Init(context.Background(), obs.Config{
 		Endpoint:       *otelEndpoint,
