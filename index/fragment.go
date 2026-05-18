@@ -81,6 +81,14 @@ type ReadSlice struct {
 	Locator    segment.Locator
 }
 
+// PlanRead is the public form of planRead. Higher layers (today the
+// store package's read path, which merges on-disk fragments with the
+// coalescer's in-memory ones) pass a combined fragment list and the
+// algorithm picks newer-seq wins across the union.
+func PlanRead(frags []Fragment, readOff, readLen int64) []ReadSlice {
+	return planRead(frags, readOff, readLen)
+}
+
 // planRead computes the byte-for-byte plan to satisfy a read of
 // [readOff, readOff+readLen) given a set of fragments. Newer-seq fragments
 // shadow older-seq fragments where they overlap. Bytes not covered by any

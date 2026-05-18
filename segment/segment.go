@@ -32,6 +32,12 @@ type Tier uint8
 const (
 	TierHot  Tier = 1
 	TierCold Tier = 2
+	// TierMem is a sentinel tier used by higher layers for in-memory
+	// fragments (the write-back coalescer). It is never persisted on
+	// disk or in a pebble locator — readers that encounter a locator
+	// with TierMem must source the bytes from the in-memory buffer
+	// that produced it, not from a segment Set.
+	TierMem Tier = 3
 )
 
 func (t Tier) String() string {
@@ -40,6 +46,8 @@ func (t Tier) String() string {
 		return "hot"
 	case TierCold:
 		return "cold"
+	case TierMem:
+		return "mem"
 	default:
 		return fmt.Sprintf("tier(%d)", t)
 	}

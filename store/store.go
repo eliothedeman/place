@@ -11,6 +11,7 @@
 package store
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -75,6 +76,12 @@ type Store struct {
 	// otherwise the only operation that violates "ancestor exists ⇒ stays
 	// valid for the duration of a path walk."
 	openMu sync.RWMutex
+
+	// coalescer absorbs FUSE writes into in-memory buffers, flushes
+	// them to the index in the background, and serves reads + Stat
+	// from the buffer when bytes haven't reached disk yet. Created in
+	// Open; drained + closed in Close.
+	coalescer *coalescer
 }
 
 // Open builds a Store on top of an already-open index.
@@ -119,11 +126,21 @@ func Open(idx *index.Index) (*Store, error) {
 	if err := batch.Commit(true); err != nil {
 		return nil, err
 	}
+	s.coalescer = newCoalescer(s)
 	return s, nil
 }
 
-// Close closes the underlying index (which closes the DB).
+// Close closes the underlying index (which closes the DB). The
+// coalescer is drained first so anything in memory makes it to disk
+// before we tear down. Idempotent.
 func (s *Store) Close() error {
+	if s.coalescer != nil {
+		// Drain forces every dirty inode through a flush. We use
+		// Background ctx — close is not cancellable from outside.
+		_ = s.coalescer.Drain(context.Background())
+		s.coalescer.Close()
+		s.coalescer = nil
+	}
 	return s.idx.Close()
 }
 
@@ -217,7 +234,11 @@ var ErrInvalid = syscall.EINVAL
 
 // --- read helpers -------------------------------------------------------
 
-// Stat returns the node metadata for inode.
+// Stat returns the node metadata for inode. The on-disk node is the
+// source of truth for everything except Size + Mtime, which may have
+// grown since the last flush — those are clamped up via the
+// coalescer's LiveAttrs so Stat never advertises a smaller size than
+// the user has actually written.
 func (s *Store) Stat(inode uint64) (Node, error) {
 	v, err := s.db.Get(kv.NodeKey(inode))
 	if err != nil {
@@ -226,7 +247,22 @@ func (s *Store) Stat(inode uint64) (Node, error) {
 	if v == nil {
 		return Node{}, ErrNotExist
 	}
-	return decodeNode(v)
+	n, err := decodeNode(v)
+	if err != nil {
+		return Node{}, err
+	}
+	if s.coalescer != nil {
+		if size, mtime, ok := s.coalescer.LiveAttrs(inode); ok {
+			if size > n.Size {
+				n.Size = size
+			}
+			if mtime > n.Mtime {
+				n.Mtime = mtime
+				n.Ctime = mtime
+			}
+		}
+	}
+	return n, nil
 }
 
 // readNode is a small helper for code paths inside a write batch that
@@ -567,6 +603,11 @@ func (s *Store) Unlink(parent uint64, name string) error {
 		return err
 	}
 	if freeInode != 0 {
+		// Drop any buffered writes for this inode — the file is gone,
+		// so flushing would just leave orphan segment bytes for GC.
+		if s.coalescer != nil {
+			s.coalescer.Drop(freeInode)
+		}
 		return s.idx.DeleteInode(freeInode)
 	}
 	return nil
@@ -780,6 +821,9 @@ func (s *Store) Rename(oldParent uint64, oldName string, newParent uint64, newNa
 		return err
 	}
 	if freeInode != 0 {
+		if s.coalescer != nil {
+			s.coalescer.Drop(freeInode)
+		}
 		return s.idx.DeleteInode(freeInode)
 	}
 	return nil
@@ -866,6 +910,13 @@ func (s *Store) Setattr(inode uint64, sa SetAttr) (Node, error) {
 			return Node{}, err
 		}
 		if *sa.Size < cur.Size {
+			// Order matters: invalidate buffered extents past the new
+			// size BEFORE we touch the on-disk fragments. Otherwise a
+			// concurrent flush could land bytes past the new size right
+			// after idx.Truncate returns.
+			if s.coalescer != nil {
+				s.coalescer.InvalidatePastSize(inode, *sa.Size)
+			}
 			if err := s.idx.Truncate(inode, *sa.Size); err != nil {
 				return Node{}, err
 			}

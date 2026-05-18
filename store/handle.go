@@ -8,6 +8,7 @@ import (
 	"github.com/eliothedeman/place/index"
 	"github.com/eliothedeman/place/kv"
 	"github.com/eliothedeman/place/obs"
+	"github.com/eliothedeman/place/segment"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -30,8 +31,11 @@ func (h *Handle) ReadAt(p []byte, off int64) (int, error) {
 	return h.ReadAtCtx(context.Background(), p, off)
 }
 
-// ReadAtCtx is the ctx-aware variant of ReadAt. Tracing spans started
-// inside the call attach to ctx.
+// ReadAtCtx merges any in-memory writes from the coalescer with the
+// on-disk fragments from the index, then runs planRead over the union
+// to decide which slices come from buffered memory and which from
+// disk. Reads from a freshly written byte are guaranteed to see those
+// bytes — buffered extents shadow on-disk fragments by seq.
 func (h *Handle) ReadAtCtx(ctx context.Context, p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -55,11 +59,32 @@ func (h *Handle) ReadAtCtx(ctx context.Context, p []byte, off int64) (int, error
 	if off+int64(len(p)) > node.Size {
 		p = p[:node.Size-off]
 	}
-	plan, err := h.store.idx.PlanReadCtx(ctx, h.inode, off, int64(len(p)))
+
+	// Combine on-disk fragments + in-memory extents from the
+	// coalescer. Sort/shadow happens in PlanRead via seq comparison;
+	// memory extents carry the same seq we'll stamp on disk when they
+	// flush, so the ordering stays consistent across the transition.
+	diskFrags, err := h.store.idx.FragmentsInRange(h.inode, off, int64(len(p)))
 	if err != nil {
 		recordHandleSpanError(span, err)
 		return 0, err
 	}
+	var memFrags []index.Fragment
+	if h.store.coalescer != nil {
+		memFrags = h.store.coalescer.FragmentsFor(h.inode, off, int64(len(p)))
+	}
+	combined := diskFrags
+	if len(memFrags) > 0 {
+		combined = make([]index.Fragment, 0, len(diskFrags)+len(memFrags))
+		combined = append(combined, diskFrags...)
+		combined = append(combined, memFrags...)
+	}
+	span.SetAttributes(
+		attribute.Int("disk_fragments", len(diskFrags)),
+		attribute.Int("mem_fragments", len(memFrags)),
+	)
+	plan := index.PlanRead(combined, off, int64(len(p)))
+
 	for _, sl := range plan {
 		dst := p[sl.LogicalOff-off : sl.LogicalOff-off+sl.Length]
 		if sl.Sparse {
@@ -68,9 +93,17 @@ func (h *Handle) ReadAtCtx(ctx context.Context, p []byte, off int64) (int, error
 			}
 			continue
 		}
-		if _, err := h.store.idx.ReadAtCtx(ctx, sl.Locator, dst); err != nil {
-			recordHandleSpanError(span, err)
-			return 0, err
+		switch sl.Locator.Tier {
+		case segment.TierMem:
+			if _, err := h.store.coalescer.CopyOut(h.inode, sl.Locator, sl.LogicalOff, dst); err != nil {
+				recordHandleSpanError(span, err)
+				return 0, err
+			}
+		default:
+			if _, err := h.store.idx.ReadAtCtx(ctx, sl.Locator, dst); err != nil {
+				recordHandleSpanError(span, err)
+				return 0, err
+			}
 		}
 	}
 	return len(p), nil
@@ -94,13 +127,13 @@ func (h *Handle) WriteAtTier(p []byte, off int64, tier index.Tier) (int, error) 
 	return h.WriteAtTierCtx(context.Background(), p, off, tier)
 }
 
-// WriteAtTierCtx is the ctx-aware variant of WriteAtTier. This is the
-// canonical write path for the FUSE adapter; the non-ctx wrappers exist
-// for tests + the migrator.
+// WriteAtTierCtx is the canonical write path for the FUSE adapter. It
+// hands the bytes to the coalescer and returns as soon as the data is
+// in process memory; the coalescer's background flushers commit to
+// disk in batched fashion later. Durability is honored on Fsync.
 //
-// The fragment commit and the node Size/Mtime update share a single
-// bbolt write tx via index.AppendToWithTxCtx — one fsync per FUSE
-// write instead of two.
+// Tier is honored at flush time — the buffer carries the requested
+// tier per extent.
 func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier index.Tier) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -114,11 +147,26 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 	)
 	defer span.End()
 
+	if h.store.coalescer == nil {
+		// Fallback: no coalescer (only happens in narrow test paths).
+		// Reuse the old synchronous flow so behavior is identical.
+		return h.writeAtTierSync(ctx, p, off, tier)
+	}
+	if err := h.store.coalescer.Write(ctx, h.inode, off, p, tier); err != nil {
+		recordHandleSpanError(span, err)
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// writeAtTierSync is the no-coalescer fallback. Synchronous path that
+// goes straight through index.AppendToWithTxCtx with the node-update
+// hook inline. Used only when the Store was constructed without a
+// coalescer (tests that exercise the index directly, future
+// dev-mode-disable flag).
+func (h *Handle) writeAtTierSync(ctx context.Context, p []byte, off int64, tier index.Tier) (int, error) {
 	end := off + int64(len(p))
 	now := time.Now().UnixNano()
-	// nodeUpdate runs inside index's pebble batch. The read is against
-	// the parent DB (kv.Batch.Get goes to the DB, not the batch), so it
-	// sees the pre-commit state — same as the bbolt-era semantics.
 	nodeUpdate := func(b *kv.Batch) error {
 		v, err := b.Get(kv.NodeKey(h.inode))
 		if err != nil {
@@ -139,7 +187,6 @@ func (h *Handle) WriteAtTierCtx(ctx context.Context, p []byte, off int64, tier i
 		return b.Set(kv.NodeKey(h.inode), encodeNode(n))
 	}
 	if err := h.store.idx.AppendToWithTxCtx(ctx, h.inode, off, p, tier, nodeUpdate); err != nil {
-		recordHandleSpanError(span, err)
 		return 0, err
 	}
 	return len(p), nil
@@ -226,11 +273,20 @@ func (h *Handle) Sync() error {
 	return h.SyncCtx(context.Background())
 }
 
-// SyncCtx is the ctx-aware variant of Sync.
+// SyncCtx drains every buffered write for this Handle's inode and
+// blocks until the bytes are durable on disk (segment file + pebble
+// WAL). This is the "never lie about fsync" enforcement point — it
+// must wait for the actual flush, not just enqueue it.
 func (h *Handle) SyncCtx(ctx context.Context) error {
 	ctx, span := obs.Tracer().Start(ctx, "store.sync")
 	span.SetAttributes(attribute.Int64("inode", int64(h.inode)))
 	defer span.End()
+	if h.store.coalescer != nil {
+		if err := h.store.coalescer.Fsync(ctx, h.inode); err != nil {
+			recordHandleSpanError(span, err)
+			return err
+		}
+	}
 	if err := h.store.idx.SyncCtx(ctx); err != nil {
 		recordHandleSpanError(span, err)
 		return err
@@ -243,4 +299,3 @@ func (h *Handle) SyncCtx(ctx context.Context) error {
 func (h *Handle) Close() error {
 	return nil
 }
-

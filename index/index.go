@@ -231,6 +231,11 @@ func (idx *Index) nextSeq() uint64 {
 	return idx.seqGen.Add(1)
 }
 
+// NextSeq is the public form of nextSeq, exposed so the coalescer can
+// stamp buffered writes with seqs that sort correctly against on-disk
+// fragments at read-merge time.
+func (idx *Index) NextSeq() uint64 { return idx.nextSeq() }
+
 // migrateBlobsToFragments walks the legacy blob-per-stripe layout (length-13
 // keys under the 's' tag, value = concatenated Fragment list) and splits each
 // blob into per-fragment keys (length-21, value = single Fragment), then
@@ -385,16 +390,33 @@ func (idx *Index) AppendToCtx(ctx context.Context, inode uint64, logicalOff int6
 	return idx.AppendToWithTxCtx(ctx, inode, logicalOff, payload, tier, nil)
 }
 
+// AppendExtent is one stripe-bounded fragment-to-be: a seq pre-assigned
+// by the caller, the logical file offset, the bytes to write, and the
+// destination tier. The coalescer (store.coalescer) builds AppendExtents
+// at FUSE-write time and hands them to AppendBatchCtx at flush time.
+//
+// Constraint: each extent must lie entirely within one stripe. Callers
+// that have a write straddling a stripe boundary must split it
+// themselves (typically by calling idx.StripeSize() and walking the
+// payload). AppendBatchCtx fails the call if the constraint is
+// violated, rather than silently splitting — splitting would require
+// new seqs and break the caller's "one seq, one extent" invariant.
+type AppendExtent struct {
+	Seq  uint64
+	Off  int64
+	Data []byte
+	Tier Tier
+}
+
 // AppendToWithTxCtx is AppendToCtx + an optional txHook that runs inside
 // the same pebble batch that commits the fragments. The hook lets a
-// caller (today: store.WriteAtTierCtx) fold an unrelated key update —
-// e.g. bumping the file's Size/Mtime — into the same WAL fsync, halving
-// the commit count per logical write.
+// caller (today: the coalescer's flusher) fold an unrelated key update
+// — e.g. bumping the file's Size/Mtime — into the same WAL fsync.
 //
-// All chunks of one call are committed in a single batch. The batch is a
-// kv.Batch, not a bbolt.Tx; the parent DB still serves reads through the
-// hook so existing read-then-write patterns work without read-your-own-
-// writes from inside the batch.
+// All chunks of one call are committed in a single batch. The batch is
+// a kv.Batch, not a bbolt.Tx; the parent DB still serves reads through
+// the hook so existing read-then-write patterns work without
+// read-your-own-writes from inside the batch.
 //
 // Unlike the bbolt era, pebble's group commit in the WAL coalesces
 // concurrent commits automatically — there's no MaxBatchDelay floor.
@@ -410,20 +432,67 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 		}
 		return b.Commit(true)
 	}
+	// Split payload at stripe boundaries, assign fresh seqs, and forward
+	// to AppendBatchCtx. Per-stripe extents are constructed in arrival
+	// order; their seqs are therefore monotonic — important when several
+	// chunks of one write fall into the same stripe and we need a
+	// deterministic newer-wins ordering.
+	var extents []AppendExtent
+	rem := payload
+	off := logicalOff
+	for len(rem) > 0 {
+		stripeID := idx.stripeOf(off)
+		stripeEnd := (int64(stripeID) + 1) * idx.stripeSize
+		chunkLen := int64(len(rem))
+		if off+chunkLen > stripeEnd {
+			chunkLen = stripeEnd - off
+		}
+		extents = append(extents, AppendExtent{
+			Seq:  idx.nextSeq(),
+			Off:  off,
+			Data: rem[:chunkLen],
+			Tier: tier,
+		})
+		rem = rem[chunkLen:]
+		off += chunkLen
+	}
+	return idx.AppendBatchCtx(ctx, inode, extents, txHook)
+}
+
+// AppendBatchCtx writes a pre-formed list of stripe-bounded extents,
+// each with its own caller-assigned seq, in one batched IO + pebble
+// commit. This is the lower-level entry point used by the coalescer's
+// flusher: the coalescer accumulates many FUSE writes in memory, then
+// hands them in as one AppendBatchCtx call so the per-chunk segment
+// fsyncs collapse to one fsync-per-touched-segment and the per-batch
+// pebble commit covers every fragment + the optional txHook.
+//
+// Lock discipline matches AppendToWithTxCtx: writeMu.RLock for the
+// whole call; Move/Truncate/DeleteInode block while we run. The
+// per-inode commit lock is taken only when txHook is present, so
+// independent flushers to different inodes never serialise.
+func (idx *Index) AppendBatchCtx(ctx context.Context, inode uint64, extents []AppendExtent, txHook func(*kv.Batch) error) error {
+	if len(extents) == 0 {
+		if txHook == nil {
+			return nil
+		}
+		b := idx.db.NewBatch()
+		if err := txHook(b); err != nil {
+			b.Close()
+			return err
+		}
+		return b.Commit(true)
+	}
+
 	ctx, span := obs.Tracer().Start(ctx, "index.append")
 	span.SetAttributes(
 		attribute.Int64("inode", int64(inode)),
-		attribute.Int64("logical_off", logicalOff),
-		attribute.Int("payload_bytes", len(payload)),
-		attribute.String("tier", tier.String()),
+		attribute.Int("extents", len(extents)),
 		attribute.Bool("has_tx_hook", txHook != nil),
 	)
 	defer span.End()
 
-	// Hold writeMu.RLock for the whole call: every chunk's segment write
-	// happens under the same reader-section, and the single pebble batch
-	// below also runs under it. Move/Truncate/DeleteInode are the only
-	// things that take the writer lock; they block all of this.
+	// Hold writeMu.RLock for the whole call.
 	_, acqSpan := obs.Tracer().Start(ctx, "index.write_lock_rlock")
 	idx.writeMu.RLock()
 	acqSpan.End()
@@ -434,84 +503,81 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	}()
 	ctx = heldCtx
 
-	// Stage every chunk: assign a fresh seq atomically (no lock needed —
-	// seqGen.Add is contention-free), write to segment + fsync, record
-	// the fragment for the batch below.
+	// Stage every extent: validate it's stripe-bounded, write to segment,
+	// build pending fragment. We fsync each touched segment exactly once
+	// at the end of staging, not per-extent — that's the batching win.
 	type pending struct {
 		stripeID uint32
-		seq      uint64
 		frag     Fragment
 	}
-	var pendings []pending
-	rem := payload
-	off := logicalOff
-	chunkIdx := 0
-	for len(rem) > 0 {
-		stripeID := idx.stripeOf(off)
+	pendings := make([]pending, 0, len(extents))
+	touchedSegs := make(map[*segment.Segment]struct{})
+	var totalBytes int
+	for i, e := range extents {
+		stripeID := idx.stripeOf(e.Off)
 		stripeEnd := (int64(stripeID) + 1) * idx.stripeSize
-		chunkLen := int64(len(rem))
-		if off+chunkLen > stripeEnd {
-			chunkLen = stripeEnd - off
+		if e.Off+int64(len(e.Data)) > stripeEnd {
+			err := fmt.Errorf("index: AppendBatchCtx: extent %d off=%d len=%d straddles stripe boundary at %d", i, e.Off, len(e.Data), stripeEnd)
+			recordSpanError(span, err)
+			return err
 		}
-		chunk := rem[:chunkLen]
-
-		seq := idx.nextSeq()
-		set := idx.setFor(tier)
-		seg, err := set.ActiveCtx(ctx, segment.FramedSize(len(chunk)))
+		set := idx.setFor(e.Tier)
+		seg, err := set.ActiveCtx(ctx, segment.FramedSize(len(e.Data)))
 		if err != nil {
 			recordSpanError(span, err)
 			return err
 		}
 		appCtx, appSpan := obs.Tracer().Start(ctx, "segment.append")
 		appSpan.SetAttributes(
-			attribute.Int("bytes", len(chunk)),
-			attribute.Int("chunk_idx", chunkIdx),
+			attribute.Int("bytes", len(e.Data)),
+			attribute.Int("extent_idx", i),
 			attribute.Int64("segment_id", int64(seg.ID())),
 		)
 		payloadOff, err := seg.AppendCtx(appCtx, segment.RecordHeader{
 			Inode:      inode,
 			StripeID:   stripeID,
-			Seq:        seq,
-			LogicalOff: off,
-			Length:     uint32(len(chunk)),
-		}, chunk)
+			Seq:        e.Seq,
+			LogicalOff: e.Off,
+			Length:     uint32(len(e.Data)),
+		}, e.Data)
 		appSpan.End()
 		if err != nil {
 			recordSpanError(span, err)
 			return err
 		}
-		if err := seg.SyncCtx(ctx); err != nil {
-			recordSpanError(span, err)
-			return err
-		}
-
+		touchedSegs[seg] = struct{}{}
+		totalBytes += len(e.Data)
 		pendings = append(pendings, pending{
 			stripeID: stripeID,
-			seq:      seq,
 			frag: Fragment{
-				Seq:           seq,
-				LogicalOff:    off,
-				Length:        chunkLen,
-				Tier:          tier,
+				Seq:           e.Seq,
+				LogicalOff:    e.Off,
+				Length:        int64(len(e.Data)),
+				Tier:          e.Tier,
 				SegmentID:     seg.ID(),
 				SegmentOffset: payloadOff,
 			},
 		})
-		rem = rem[chunkLen:]
-		off += chunkLen
-		chunkIdx++
 	}
-	span.SetAttributes(attribute.Int("chunks", chunkIdx))
+	span.SetAttributes(attribute.Int("bytes", totalBytes))
+
+	// One fsync per touched segment. Concurrent flusher goroutines'
+	// fsyncs to the same fd collapse in the kernel, so we don't hold
+	// any lock across this.
+	syncCtx, syncSpan := obs.Tracer().Start(ctx, "segment.sync_all")
+	syncSpan.SetAttributes(attribute.Int("touched_segments", len(touchedSegs)))
+	for seg := range touchedSegs {
+		if err := seg.SyncCtx(syncCtx); err != nil {
+			syncSpan.End()
+			recordSpanError(span, err)
+			return err
+		}
+	}
+	syncSpan.End()
 
 	// One pebble commit covers every fragment + the optional hook.
-	// Per-fragment keys mean fragment Sets never conflict with each
-	// other — concurrent appenders to the same inode/stripe write to
-	// distinct keys (distinguished by their unique seq), so the only
-	// reason we'd still need the per-inode lock is the hook's
-	// read-modify-write (e.g. node.Size = max(...)). Without a hook we
-	// skip the lock entirely; with a hook we take it for the duration
-	// of the commit so concurrent hooks don't lose each other's
-	// updates.
+	// With per-fragment keys the fragment Sets never conflict; only the
+	// hook's read-modify-write needs the per-inode commit lock.
 	if txHook != nil {
 		cl := idx.commitLockFor(inode)
 		cl.Lock()
@@ -525,7 +591,7 @@ func (idx *Index) AppendToWithTxCtx(ctx context.Context, inode uint64, logicalOf
 	b := idx.db.NewBatch()
 	_, fnSpan := obs.Tracer().Start(batchCtx, "pebble.commit_fn")
 	for _, p := range pendings {
-		if err := b.Set(kv.FragmentKey(inode, p.stripeID, p.seq), encodeFragments([]Fragment{p.frag})); err != nil {
+		if err := b.Set(kv.FragmentKey(inode, p.stripeID, p.frag.Seq), encodeFragments([]Fragment{p.frag})); err != nil {
 			fnSpan.End()
 			commitSpan.End()
 			b.Close()
@@ -593,6 +659,19 @@ func (idx *Index) PlanReadCtx(ctx context.Context, inode uint64, off, length int
 	plan := planRead(allFrags, off, length)
 	span.SetAttributes(attribute.Int("slices", len(plan)))
 	return plan, nil
+}
+
+// FragmentsInRange returns every fragment for inode whose stripe falls
+// in [firstStripe, lastStripe] inclusive. The store package's read path
+// uses this directly to merge on-disk fragments with in-memory ones
+// from the coalescer; planRead then picks newer-seq wins across both.
+func (idx *Index) FragmentsInRange(inode uint64, off, length int64) ([]Fragment, error) {
+	if length <= 0 {
+		return nil, nil
+	}
+	first := idx.stripeOf(off)
+	last := idx.stripeOf(off + length - 1)
+	return idx.fragmentsInRange(inode, first, last)
 }
 
 // fragmentsInRange returns every fragment for inode in stripes [first, last]

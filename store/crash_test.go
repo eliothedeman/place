@@ -25,6 +25,13 @@ func TestSetattrTruncateAtomicity(t *testing.T) {
 	if _, err := h.WriteAt(body, 0); err != nil {
 		t.Fatal(err)
 	}
+	// The coalescer holds the write in memory; force it to disk so
+	// the index-side stripe check below sees fragments. Without this
+	// the test only proves the in-memory invariant, which isn't the
+	// one the durability ordering claim cares about.
+	if err := h.Sync(); err != nil {
+		t.Fatal(err)
+	}
 	h.Close()
 
 	preStripes, _ := s.idx.StripesOf(n.Inode)
